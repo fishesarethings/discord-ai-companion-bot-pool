@@ -64,6 +64,8 @@ keyfile() {
     if [[ "$(uname -s)" == "Linux" ]]; then
       sudo mkdir -p "$(dirname "$keyfile")"
       sudo "$genpy" -c "from cryptography.fernet import Fernet; open('$keyfile','wb').write(Fernet.generate_key())"
+      # Root-owned 0600 would lock out the service user — hand it over.
+      sudo chown "$USER:$USER" "$keyfile"
       sudo chmod 600 "$keyfile"
     else
       mkdir -p "$(dirname "$keyfile")"
@@ -85,6 +87,10 @@ if ! need_python; then
       # the installer sees it without opening a new terminal.
       export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
       hash -r 2>/dev/null || true
+      eval "$(brew shellenv 2>/dev/null)" || true
+      if ! need_python; then
+        die "Homebrew Python installed but not on PATH — open a new terminal and re-run."
+      fi
     else
       die "Install Homebrew from https://brew.sh, then re-run (or run: brew install python@3.12)."
     fi
@@ -103,7 +109,7 @@ mkdir -p "$BOT_DIR"
 
 if [[ ! -f "$BOT_DIR/bot.py" ]]; then
   say "Downloading Quaestio bot code…"
-  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main}"
+  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
   curl -fsSL "$BASE/bot.py" -o "$BOT_DIR/bot.py" || die "Could not download bot.py (check your network)."
   curl -fsSL "$BASE/config.py" -o "$BOT_DIR/config.py" || warn "Could not download config.py."
   curl -fsSL "$BASE/quaestio.py" -o "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
@@ -115,25 +121,26 @@ else
   # Make sure config.py exists too (added in a later version)
   if [[ ! -f "$BOT_DIR/config.py" ]]; then
     say "Fetching config.py…"
-    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main}"
+    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
     curl -fsSL "$BASE/config.py" -o "$BOT_DIR/config.py" || warn "Could not download config.py."
   fi
   if [[ ! -f "$BOT_DIR/quaestio.py" ]]; then
     say "Fetching the manage tool (quaestio.py)…"
-    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main}"
+    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
     curl -fsSL "$BASE/quaestio.py" -o "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
   fi
   # The wizard gets refreshed on every run so fixes/tweaks reach you instantly.
   say "Fetching the latest install wizard…"
-  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main}"
+  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
   curl -fsSL "$BASE/install_wizard.py" -o "$BOT_DIR/install_wizard.py" || warn "Could not download the install wizard."
 fi
 chmod +x "$BOT_DIR/quaestio.py" 2>/dev/null || true
 
 # --- 3. Virtualenv + deps ------------------------------------------------------
-if [[ ! -x "$VENV/bin/python" ]]; then
+if [[ ! -x "$VENV/bin/python" ]] || ! "$VENV/bin/python" -c "import sys; sys.exit(0)" 2>/dev/null; then
   say "Creating virtualenv…"
-  python3 -m venv "$VENV"
+  rm -rf "$VENV"
+  python3 -m venv "$VENV" || die "Could not create a virtualenv (install python3-venv?)."
 fi
 say "Installing dependencies…"
 "$VENV/bin/pip" --quiet install --upgrade pip
@@ -171,7 +178,7 @@ if [[ -f "$INSTALL_WIZARD" ]] && { [[ -t 0 ]] || [[ -e /dev/tty ]]; } \
     QUAESTIO_MODEL="$MODEL" \
     QUAESTIO_DIR="$INSTALL_DIR" \
     QUAESTIO_KEY_FILE="${QUAESTIO_KEY_FILE:-}" \
-    QUAESTIO_SRC="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main}" \
+    QUAESTIO_SRC="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}" \
       "$VENV/bin/python" "$INSTALL_WIZARD" < /dev/tty && WIZARD_OK=1
   else
     warn "Textual isn't installed in the venv yet — the classic text flow will be used."
@@ -248,7 +255,7 @@ install_quaestio_command
 # --- 4. Ollama (AI) ------------------------------------------------------------
 if ! command -v ollama >/dev/null 2>&1; then
   warn "Ollama (the local AI engine) is missing."
-  read -r -p "Install Ollama automatically? [y/N] " yn
+  if [[ -t 0 ]]; then read -r -p "Install Ollama automatically? [y/N] " yn; else read -r -p "Install Ollama automatically? [y/N] " yn < /dev/tty || yn="n"; fi
   if [[ "$yn" == [yY]* ]]; then
     if [[ "$(uname -s)" == "Darwin" ]]; then
       if command -v brew >/dev/null 2>&1; then
@@ -275,29 +282,33 @@ fi
 # --- 5. Config (.env) — the Discord token is always optional -------------------
 # Quaestio starts without one; add it anytime with `quaestio settings`.
 ENV_FILE="$BOT_DIR/.env"
-rebuild=0
-if [[ ! -f "$ENV_FILE" ]] || ! grep -q '[^#]' "$ENV_FILE" 2>/dev/null || grep -qi 'your-bot-token-here' "$ENV_FILE"; then
-  rebuild=1
+touch "$ENV_FILE" 2>/dev/null || true
+_q_upsert() {  # upsert KEY VALUE (preserves everything else)
+  local k="$1" v="$2"
+  if grep -q "^${k}=" "$ENV_FILE" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"
+}
+if grep -qi 'your-bot-token-here' "$ENV_FILE" 2>/dev/null; then
+  grep -v 'your-bot-token-here' "$ENV_FILE" > "$ENV_FILE.tmp" || true
+  mv "$ENV_FILE.tmp" "$ENV_FILE"
 fi
-if [[ "$rebuild" == "1" ]]; then
-  if [[ -n "${BOT_TOKEN:-}" ]]; then
-    say "Using BOT_TOKEN from the environment."
-    printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN" > "$ENV_FILE"
-  else
-    : > "$ENV_FILE"
-    warn "No Discord bot token set — that's fine. Add one later with:  quaestio settings"
-  fi
-  if [[ -n "$REMOTE_OLLAMA" ]]; then
-    printf 'OLLAMA_BASE_URL=%s\n' "$REMOTE_OLLAMA" >> "$ENV_FILE"
-  else
-    printf 'OLLAMA_BASE_URL=http://127.0.0.1:11434\n' >> "$ENV_FILE"
-  fi
-  printf 'OLLAMA_MODEL=%s\nRPC_LARGE_IMAGE=logo\n' "$MODEL" >> "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  say "Config written to $ENV_FILE (permissions 600)."
+if [[ -n "${BOT_TOKEN:-}" ]] && ! grep -q '^BOT_TOKEN=.' "$ENV_FILE" 2>/dev/null; then
+  say "Using BOT_TOKEN from the environment."
+  printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN" >> "$ENV_FILE"
+elif ! grep -q '^BOT_TOKEN=' "$ENV_FILE" 2>/dev/null; then
+  warn "No Discord bot token set — that's fine. Add one later with:  quaestio settings"
+fi
+if [[ -n "$REMOTE_OLLAMA" ]]; then
+  _q_upsert OLLAMA_BASE_URL "$REMOTE_OLLAMA"
 else
-  say "Config already present at $ENV_FILE."
+  _q_upsert OLLAMA_BASE_URL "http://127.0.0.1:11434"
 fi
+_q_upsert OLLAMA_MODEL "$MODEL"
+_q_upsert RPC_LARGE_IMAGE "logo"
+chmod 600 "$ENV_FILE"
+say "Config ensured at $ENV_FILE (permissions 600)."
 
 # --- 6. Service / launch -------------------------------------------------------
 # Pool-only boxes (no BOT_TOKEN) get the unit installed but NOT started —
@@ -305,9 +316,9 @@ fi
 has_token() { grep -q '^BOT_TOKEN=.\+' "$ENV_FILE" 2>/dev/null; }
 if [[ "$(uname -s)" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
   SERVICE=/etc/systemd/system/quaestio.service
-  if [[ ! -f "$SERVICE" ]]; then
-    say "Installing systemd service… (may ask for your sudo password)"
-    sudo tee "$SERVICE" >/dev/null <<EOF
+  # Always rewrite the unit (moves/updates would otherwise run stale paths).
+  say "Installing systemd service… (may ask for your sudo password)"
+  sudo tee "$SERVICE" >/dev/null <<EOF
 [Unit]
 Description=Quaestio Discord bot
 After=network-online.target ollama.service
@@ -324,8 +335,8 @@ User=$USER
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
-    if has_token; then
+  sudo systemctl daemon-reload
+  if has_token; then
       sudo systemctl enable --now quaestio.service
       say "Quaestio is running as a service!  Status: systemctl status quaestio  Logs: journalctl -u quaestio -f"
     else
@@ -333,15 +344,6 @@ EOF
       warn "No bot token — service installed but not started (pool-only mode)."
       say "Add one later with:  quaestio settings   then:  sudo systemctl restart quaestio"
     fi
-  else
-    if has_token; then
-      say "Systemd service already installed — restarting it."
-      sudo systemctl restart quaestio.service
-    else
-      say "Systemd service already installed — token still missing, leaving it stopped."
-      say "Add one with:  quaestio settings   then:  sudo systemctl restart quaestio"
-    fi
-  fi
 else
   RUN="$INSTALL_DIR/run-quaestio.sh"
   cat > "$RUN" <<EOF

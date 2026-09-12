@@ -25,6 +25,7 @@ if (-not $py) {
     Die "Python 3.10+ is required."
 }
 $pyVer = & python -c "import sys; print('%d.%d' % (sys.version_info[0], sys.version_info[1]))"
+if ([Version]$pyVer -lt [Version]"3.10") { Die "Python 3.10+ is required (found $pyVer)." }
 Say "Python $pyVer OK."
 
 # --- 2. Download bot code ----------------------------------------------------
@@ -72,7 +73,7 @@ Say "Installing dependencies…"
 # Falls back to the classic text prompts below (non-interactive consoles).
 $Wizard = Join-Path $BotDir "install_wizard.py"
 $WizardOK = $false
-if ((Test-Path $Wizard) -and (-not $env:QUAESTIO_NO_WIZARD) -and (-not $RemoteOllama)) {
+if ((Test-Path $Wizard) -and (-not $env:QUAESTIO_NO_WIZARD)) {
     $hasTextual = & (Join-Path $Venv "Scripts\python.exe") -c "import textual" 2>$null
     if ($LASTEXITCODE -eq 0) {
         Say "Opening the interactive installer (full-screen TUI)…"
@@ -121,7 +122,8 @@ $KeyFile = if ($env:QUAESTIO_KEY_FILE) { $env:QUAESTIO_KEY_FILE } else { Join-Pa
 if (-not (Test-Path $KeyFile)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $KeyFile) | Out-Null
     & (Join-Path $Venv "Scripts\python.exe") -c "from cryptography.fernet import Fernet; open(r'$KeyFile','wb').write(Fernet.generate_key())"
-    Say "Encryption key created at $KeyFile."
+    icacls $KeyFile /inheritance:r /grant:r "$env:USERNAME:(R,W)" 2>$null | Out-Null
+    Say "Encryption key created at $KeyFile (private to your account)."
 }
 
 # --- 4. Ollama ---------------------------------------------------------------
@@ -142,27 +144,22 @@ if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
 
 # --- 5. Config (.env) — the Discord token is always optional -------------------
 $EnvFile = Join-Path $BotDir ".env"
-$writeEnv = $true
-if (Test-Path $EnvFile) {
-    $content = Get-Content $EnvFile -Raw
-    if ($content -match "your-bot-token-here") { $writeEnv = $true } else { $writeEnv = $false }
+if (-not (Test-Path $EnvFile)) { New-Item -ItemType File -Force -Path $EnvFile | Out-Null }
+function Upsert-Env([string]$k, [string]$v) {
+    $lines = @(Get-Content $EnvFile) | Where-Object { $_ -notmatch "^$k=" -and $_ -notmatch "your-bot-token-here" }
+    $lines += "$k=$v"
+    Set-Content -Path $EnvFile -Value ($lines -join "`n")
 }
-if ($writeEnv) {
-    $envLines = @()
-    if ($env:BOT_TOKEN) {
-        Say "Using BOT_TOKEN from the environment."
-        $envLines += "BOT_TOKEN=$env:BOT_TOKEN"
-    } else {
-        Warn "No Discord bot token set — that's fine. Add one later with:  quaestio settings"
-    }
-    if ($RemoteOllama) { $envLines += "OLLAMA_BASE_URL=$RemoteOllama" } else { $envLines += "OLLAMA_BASE_URL=http://127.0.0.1:11434" }
-    $envLines += "OLLAMA_MODEL=$Model"
-    $envLines += "RPC_LARGE_IMAGE=logo"
-    Set-Content -Path $EnvFile -Value ($envLines -join "`n")
-    Say "Config written to $EnvFile (permissions 600)."
-} else {
-    Say "Config already present at $EnvFile."
+if ($env:BOT_TOKEN -and -not (Select-String -Path $EnvFile -Pattern "^BOT_TOKEN=." -Quiet)) {
+    Say "Using BOT_TOKEN from the environment."
+    Upsert-Env "BOT_TOKEN" $env:BOT_TOKEN
+} elseif (-not (Select-String -Path $EnvFile -Pattern "^BOT_TOKEN=" -Quiet)) {
+    Warn "No Discord bot token set — that's fine. Add one later with:  quaestio settings"
 }
+if ($RemoteOllama) { Upsert-Env "OLLAMA_BASE_URL" $RemoteOllama } else { Upsert-Env "OLLAMA_BASE_URL" "http://127.0.0.1:11434" }
+Upsert-Env "OLLAMA_MODEL" $Model
+Upsert-Env "RPC_LARGE_IMAGE" "logo"
+Say "Config ensured at $EnvFile."
 
 # --- 6. Launch scripts -------------------------------------------------------
 $runBat = Join-Path $InstallDir "run-quaestio.bat"

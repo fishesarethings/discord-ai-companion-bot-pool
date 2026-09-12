@@ -99,8 +99,11 @@ def is_installed():
 
 
 def venv_python():
-    p = os.path.join(VENV, "bin", "python")
-    return p if os.path.exists(p) else sys.executable
+    for cand in (os.path.join(VENV, "bin", "python"),
+                 os.path.join(VENV, "Scripts", "python.exe")):
+        if os.path.exists(cand):
+            return cand
+    return sys.executable
 
 
 def systemd_active():
@@ -136,11 +139,24 @@ def read_env(k):
 # Actions
 # ---------------------------------------------------------------------------
 
-def is_running():
+def _bot_pids():
+    """PIDs running bot.py (pgrep on unix, tasklist on Windows)."""
+    import re as _re
     try:
+        if sys.platform == "win32":
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV"],
+                                 capture_output=True, text=True).stdout
+            return [True] if "bot.py" in (out or "").lower() else []
         out = subprocess.run(["pgrep", "-f", r"python[0-9.]* .*bot\.py"],
                              capture_output=True, text=True)
-        return bool(out.stdout.strip())
+        return [l for l in (out.stdout or "").split() if l.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def is_running():
+    try:
+        return bool(_bot_pids())
     except Exception:
         return False
 
@@ -187,7 +203,11 @@ def stop():
         say("Stopped (login agent). It will not start again until you run `start`.", GREEN)
         return
     try:
-        subprocess.run(["pkill", "-f", r"python[0-9.]* .*bot\.py"])
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/IM", "python.exe", "/FI", "WINDOWTITLE eq bot*"],
+                           capture_output=True)
+        else:
+            subprocess.run(["pkill", "-f", r"python[0-9.]* .*bot\.py"], capture_output=True)
         say("Sent stop to the running bot process.", GREEN)
     except Exception:
         say("Nothing running to stop.", YELLOW)
@@ -203,16 +223,27 @@ def update():
         boom("Quaestio isn't installed here. Run the installer first:\n"
              f"  curl -fsSL https://quaestio.online/bot/install.sh | bash")
     say("Updating bot code from GitHub…")
+    import hashlib as _hl
     base = os.environ.get("QUAESTIO_SRC",
-                          "https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main")
+                          "https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot")
+    changed = False
     for f in ("bot.py", "config.py", "requirements.txt", ".env.example", "quaestio.py",
-                "install_wizard.py"):
-        subprocess.run(["curl", "-fsSL", f"{base}/{f}", "-o", os.path.join(BOT_DIR, f)])
+              "install_wizard.py", "install.sh", "install.ps1"):
+        dest = os.path.join(BOT_DIR, f)
+        before = _hl.sha256(open(dest, "rb").read()).hexdigest() if os.path.isfile(dest) else ""
+        r = subprocess.run(["curl", "-fsSL", f"{base}/{f}", "-o", dest])
+        if r.returncode != 0:
+            boom(f"Update failed downloading {f} — keeping the old copy.")
+        after = _hl.sha256(open(dest, "rb").read()).hexdigest()
+        changed = changed or (before != after)
     subprocess.run([venv_python(), "-m", "pip", "install", "--quiet",
                     "-r", os.path.join(BOT_DIR, "requirements.txt")])
     say("Code + dependencies updated.", GREEN)
-    restart()
-    say("Restarted. Check the log with `journalctl -u quaestio -f` (Linux).")
+    if changed or not is_running():
+        restart()
+        say("Restarted. Check the log with `journalctl -u quaestio -f` (Linux).")
+    else:
+        say("Already current — no restart needed.")
 
 
 def uninstall():
@@ -235,6 +266,49 @@ def uninstall():
     if os.path.exists(local_key):
         os.remove(local_key)
         wiped.append(local_key)
+    for extra in (os.path.join(INSTALL_DIR, "run-quaestio.sh"),
+                  os.path.join(INSTALL_DIR, "run-quaestio.bat"),
+                  os.path.join(INSTALL_DIR, "run-host.sh"),
+                  os.path.join(INSTALL_DIR, "host.log"),
+                  os.path.join(INSTALL_DIR, "host.err.log"),
+                  os.path.join(INSTALL_DIR, "dashboard")):
+        if os.path.isfile(extra):
+            os.remove(extra)
+            wiped.append(extra)
+        elif os.path.isdir(extra):
+            shutil.rmtree(extra, ignore_errors=True)
+            wiped.append(extra)
+    mac_plist = os.path.expanduser("~/Library/LaunchAgents/com.quaestio.host.plist")
+    if os.path.exists(mac_plist):
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", mac_plist], capture_output=True)
+        try:
+            os.remove(mac_plist)
+            wiped.append(mac_plist)
+        except OSError:
+            pass
+    for rc in (os.path.expanduser("~/.zshrc"), os.path.expanduser("~/.bashrc")):
+        try:
+            if os.path.isfile(rc):
+                with open(rc) as f:
+                    lines = f.readlines()
+
+                def _is_ours(line):
+                    t = line.strip()
+                    return t.endswith("# quaestio") and t.startswith("export PATH=")
+
+                kept = [line for line in lines if not _is_ours(line)]
+                if len(kept) != len(lines):
+                    with open(rc, "w") as f:
+                        f.writelines(kept)
+                    wiped.append(rc + " (PATH line)")
+        except Exception:
+            pass
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["schtasks", "/Delete", "/TN", "QuaestioBot", "/F"], capture_output=True)
+            wiped.append("QuaestioBot scheduled task")
+        except Exception:
+            pass
     if os.path.isdir(INSTALL_DIR):
         shutil.rmtree(INSTALL_DIR, ignore_errors=True)
         wiped.append(INSTALL_DIR)
@@ -295,7 +369,7 @@ def install_menu():
     os.makedirs(BOT_DIR, exist_ok=True)
     say("Fetching the latest installer wizard…")
     base = os.environ.get("QUAESTIO_SRC",
-                          "https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main")
+                          "https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot")
     fetched = False
     # curl first (handles proxies/certs better on some Macs), then urllib.
     if which("curl"):
@@ -321,7 +395,7 @@ def install_menu():
     env = dict(os.environ)
     env.setdefault("QUAESTIO_DIR", INSTALL_DIR)
     env.setdefault("BOT_TOKEN", read_env("BOT_TOKEN") or "")
-    env.setdefault("QUAESTIO_SRC", "https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main")
+    env.setdefault("QUAESTIO_SRC", "https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot")
     if os.path.exists(KEYFILE_LOCAL) and not os.environ.get("QUAESTIO_KEY_FILE"):
         env["QUAESTIO_KEY_FILE"] = KEYFILE_LOCAL
     subprocess.call([sys.executable, wizard], env=env)
@@ -534,6 +608,7 @@ def pool_serve():
     _verify_models(_probe_ollama_models("http://127.0.0.1:11434") or ["qwen2.5:1.5b"])
     say("Serving pool jobs — Ctrl-C to stop. Offline just idles.", GREEN)
     backoff = 5
+    idle_backoff = 3
     while True:
         try:
             models = _probe_ollama_models("http://127.0.0.1:11434")
@@ -544,14 +619,28 @@ def pool_serve():
             claim = _pool_json(broker.rstrip("/") + "/api/pool/jobs/claim",
                                {"node_secret": node_secret, "models": models})
             if "error" in claim:
-                say(f"Broker hiccup ({claim['error']}) — retrying…", YELLOW)
+                err = claim["error"]
+                if "404" in err and "Unknown node" in err:
+                    # Removed server-side: re-register once as fresh.
+                    say("Node gone from pool — re-registering…", YELLOW)
+                    _write_pool_creds({"name": "", "node_secret": ""})
+                    reg = _pool_json(broker.rstrip("/") + "/api/pool/register",
+                                     {"pull": 1, "model": models[0], "share": 50})
+                    if "error" not in reg and reg.get("node_secret"):
+                        _write_pool_creds(reg)
+                        node_secret = reg["node_secret"]
+                        say(f"Re-registered as {reg.get('name')}.", GREEN)
+                        continue
+                say(f"Broker hiccup ({err}) — retrying…", YELLOW)
                 time.sleep(15)
                 continue
             job = claim.get("job")
             if not job:
-                time.sleep(3)
+                time.sleep(idle_backoff)
+                idle_backoff = min(idle_backoff + 2, 30)
                 backoff = 5
                 continue
+            idle_backoff = 3
             say(f"Job {job['id']} ({job['model']})…", DIM)
             try:
                 answer = _ollama_generate(job)
@@ -578,12 +667,27 @@ def pool_serve():
 # Models the pool trusts. Ollama can't run encrypted blobs, so protection is:
 # allowlist (unknown models are refused) + digest continuity (first-seen blob
 # hash pinned in .env; a swapped model screams instead of serving silently).
-MODELS_ALLOWED = ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b",
-                  "llama3.2:3b", "tinyllama:latest"]
+MODELS_ALLOWED = ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b",
+                  "llama3.2:1b", "llama3.2:3b", "phi4-mini:3.8b", "tinyllama:latest"]
 
 
 def _model_digest(model):
-    """Blob digest from `ollama show`, or '' if unknown."""
+    """Blob digest for tamper-evidence, or '' if unknown. Prefers
+    `ollama show --json` (stable schema) over parsing the Modelfile."""
+    import json as _json
+    try:
+        p = subprocess.run(["ollama", "show", model, "--json"],
+                           capture_output=True, text=True, timeout=15)
+        data = _json.loads(p.stdout or "{}")
+        for key in ("digest", "sha256", "hash"):
+            if data.get(key):
+                return str(data[key])[:120]
+        details = data.get("details") or {}
+        for key in ("digest", "parent"):
+            if details.get(key):
+                return str(details[key])[:120]
+    except Exception:
+        pass
     try:
         p = subprocess.run(["ollama", "show", model], capture_output=True, text=True, timeout=15)
         for line in (p.stdout or "").splitlines():
@@ -774,11 +878,16 @@ def contribute():
         )"""
     )
     ehash = hashlib.sha256(endpoint.strip().rstrip("/").lower().encode()).hexdigest()
-    conn.execute(
-        "INSERT INTO hosters (name, endpoint, model, share, enabled, added_by, at, endpoint_hash) "
-        "VALUES (?, ?, ?, ?, 1, 'cli', ?, ?)",
-        (_anon_name(), enc_endpoint, enc_model, share, datetime.datetime.now().isoformat(), ehash),
-    )
+    row = conn.execute("SELECT id FROM hosters WHERE endpoint_hash=?", (ehash,)).fetchone()
+    if row:
+        conn.execute("UPDATE hosters SET model=?, share=?, enabled=1 WHERE id=?",
+                     (enc_model, share, row[0]))
+    else:
+        conn.execute(
+            "INSERT INTO hosters (name, endpoint, model, share, enabled, added_by, at, endpoint_hash) "
+            "VALUES (?, ?, ?, ?, 1, 'cli', ?, ?)",
+            (_anon_name(), enc_endpoint, enc_model, share, datetime.datetime.now().isoformat(), ehash),
+        )
     conn.commit()
     conn.close()
     say(f"Done. You're contributing {share}% of your box to the local pool.", GREEN)
@@ -1143,7 +1252,10 @@ if _TApp is not None and ModalScreen is not None:
                         r["endpoint"] if r else (read_env("OLLAMA_BASE_URL") or "http://127.0.0.1:11434"))
                     model = result if key == "POOL_MODEL" else (
                         r["model"] if r else (read_env("OLLAMA_MODEL") or "qwen2.5:1.5b"))
-                    share = int(result) if key == "POOL_SHARE" else (r["share"] if r else 50)
+                    try:
+                        share = max(0, min(100, int(result))) if key == "POOL_SHARE" else (r["share"] if r else 50)
+                    except (ValueError, TypeError):
+                        share = r["share"] if r else 50
                     _pool_apply(endpoint or "http://127.0.0.1:11434", model or "qwen2.5:1.5b", share)
                 self.query_one("#v_" + key, Static).update(f"[dim]    {_settings_current(kind, key)}[/dim]")
                 if kind == "pool":
@@ -1183,9 +1295,8 @@ def localweb():
     if mode not in ("y", "yes"):
         say("Local web panel stays off.")
         return
-    env_file = os.path.join(BOT_DIR, ".env")
-    with open(env_file, "a") as f:
-        f.write(f"LOCAL_WEB=1\nLOCAL_WEB_PORT={LOCAL_PORT}\n")
+    _write_env_key("LOCAL_WEB", "1")
+    _write_env_key("LOCAL_WEB_PORT", str(LOCAL_PORT))
     say(f"Enabled. Point your browser at http://127.0.0.1:{LOCAL_PORT} (or "
         "http://localhost:{LOCAL_PORT}). A page is served that lets you edit "
         "the same settings the CLI does.", GREEN)
@@ -1398,11 +1509,11 @@ def menu_plain():
         ("4", "Settings", settings, "change tokens, model, timeout…"),
         ("5", "Contribute to the pool", contribute, "join / update / leave the community pool"),
         ("6", "Pool status", pool_status, "your contributions: requests served, share, health"),
-        ("11", "Rename node", rename, "fresh random node ID (weekly privacy)"),
-        ("7", "Local web panel", localweb, "turn the localhost settings page on/off"),
-        ("8", "Update", update, "pull the latest bot code"),
-        ("9", "Uninstall", uninstall, "remove everything, nothing left behind"),
-        ("10", "About / help", help_text, "how everything works"),
+        ("7", "Rename node", rename, "fresh random node ID (weekly privacy)"),
+        ("8", "Local web panel", localweb, "turn the localhost settings page on/off"),
+        ("9", "Update", update, "pull the latest bot code"),
+        ("10", "Uninstall", uninstall, "remove everything, nothing left behind"),
+        ("11", "About / help", help_text, "how everything works"),
         ("0", "Quit", None, "close this menu"),
     ]
     for num, name, _fn, desc in menu_actions:

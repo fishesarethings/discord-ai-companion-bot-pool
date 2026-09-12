@@ -21,7 +21,7 @@ BOT_DIR = os.path.join(INSTALL_DIR, "bot")
 DASH_DIR = os.path.join(INSTALL_DIR, "dashboard")
 VENV = os.path.join(INSTALL_DIR, ".venv")
 SERVICE = "/etc/systemd/system/quaestio.service"
-SRC = os.environ.get("QUAESTIO_SRC", "https://raw.githubusercontent.com/fishesarethings/quaestio-bot/main")
+SRC = os.environ.get("QUAESTIO_SRC", "https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot")
 MODEL_DEFAULT = os.environ.get("QUAESTIO_MODEL", "qwen2.5:1.5b")
 MODELS = [
     "qwen2.5:0.5b",
@@ -329,7 +329,7 @@ class Connections(_NavScreen):
             )
             yield mode
             remote = Input(placeholder="http://192.168.1.50:11434", value=cfg.remote_endpoint, id="remote")
-            remote.disabled = not cfg.remote_endpoint
+            remote.disabled = (cfg.endpoint_mode != "remote")
             yield Static("Remote Ollama URL:", classes="lbl")
             yield remote
             yield Static("  [b]Model[/b]  — bigger = smarter, slower, more RAM.", classes="title")
@@ -362,7 +362,7 @@ class Location(_NavScreen):
             yield Static("  [b]Portable install — where should everything go?[/b]", classes="title")
             yield Static(
                 "  Bot code, dashboard and the Python environment all live in one\n"
-                "  portable folder — default is your Downloads folder. Type a path\n"
+                "  portable folder — default is ~/quaestio. Type a path\n"
                 "  below or press [b]Browse…[/b] to pick one (shows a native folder\n"
                 "  selector on macOS; Linux uses zenity/kdialog if installed).",
                 classes="sub")
@@ -455,7 +455,11 @@ class Pool(_NavScreen):
         yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        cfg.pool_share = int(self.query_one("#share", Select).value or 50)
+        try:
+            want = int(self.query_one("#share", Select).value or 50)
+        except (ValueError, TypeError):
+            want = 50
+        cfg.pool_share = min((10, 25, 50, 75, 100), key=lambda o: abs(o - want))
         if event.button.id == "back":
             self.app.switch_screen("connections")
         elif event.button.id == "next":
@@ -529,9 +533,12 @@ class Run(_NavScreen):
 # Install steps
 # ---------------------------------------------------------------------------
 def _run(cmd, silent=False):
+    """Run and return stdout. silent only mutes output capture noise — a
+    non-zero exit ALWAYS raises, so no step can report success on failure."""
     r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 and not silent:
-        raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "command failed")
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        raise RuntimeError(tail[-1] if tail else "command failed")
     return r.stdout.strip()
 
 
@@ -551,8 +558,15 @@ def _step_keyfile():
         "os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)"
     )
     if sys.platform.startswith("linux") and os.geteuid() != 0:
+        import pwd
+        try:
+            owner = pwd.getpwuid(os.geteuid()).pw_name
+        except KeyError:
+            owner = os.environ.get("USER", "root")
         _run(["sudo", "mkdir", "-p", os.path.dirname(keypath)])
         _run(["sudo", "python3", "-c", code, keypath])
+        # Root-owned 0600 would lock out the service user — hand it over.
+        _run(["sudo", "chown", f"{owner}:{owner}", keypath])
         _run(["sudo", "chmod", "600", keypath])
     else:
         os.makedirs(os.path.dirname(keypath), exist_ok=True)
@@ -611,8 +625,8 @@ def _step_env():
     if cfg.token and not lines.get("BOT_TOKEN"):
         lines["BOT_TOKEN"] = cfg.token
     endpoint = cfg.remote_endpoint if (cfg.endpoint_mode == "remote" and cfg.remote_endpoint) else "http://127.0.0.1:11434"
-    lines.setdefault("OLLAMA_BASE_URL", endpoint)
-    lines.setdefault("OLLAMA_MODEL", cfg.model)
+    lines["OLLAMA_BASE_URL"] = endpoint
+    lines["OLLAMA_MODEL"] = cfg.model
     lines.setdefault("RPC_LARGE_IMAGE", "logo")
     with open(env_file, "w") as f:
         for k, v in lines.items():
@@ -649,8 +663,11 @@ def _step_pull_model():
     r = subprocess.run(["ollama", "list"], capture_output=True, text=True)
     if cfg.model in r.stdout:
         return f"model {cfg.model} already present"
-    subprocess.run(["ollama", "pull", cfg.model], capture_output=True, text=True)
-    return f"model {cfg.model} pulled (this can take a few minutes)"
+    p = subprocess.run(["ollama", "pull", cfg.model], capture_output=True, text=True)
+    if p.returncode != 0 or cfg.model not in subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True).stdout:
+        raise RuntimeError(f"model pull failed — run `ollama pull {cfg.model}` by hand")
+    return f"model {cfg.model} pulled"
 
 
 def _step_service():
@@ -695,9 +712,22 @@ User={os.environ.get('USER', 'root')}
 [Install]
 WantedBy=multi-user.target
 """
-    with open("/tmp/qfsvc", "w") as f:
-        f.write(unit)
-    _run(["sudo", "cp", "/tmp/qfsvc", SERVICE], silent=True)
+    import tempfile as _tf
+    _fd, _svc_tmp = _tf.mkstemp(prefix="qfsvc-")
+    try:
+        with open(_svc_tmp, "w") as f:
+            f.write(unit)
+        os.chmod(_svc_tmp, 0o644)
+        _run(["sudo", "cp", _svc_tmp, SERVICE], silent=True)
+    finally:
+        try:
+            os.close(_fd)
+        except Exception:
+            pass
+        try:
+            os.remove(_svc_tmp)
+        except OSError:
+            pass
     _run(["sudo", "systemctl", "daemon-reload"], silent=True)
     if has_token:
         _run(["sudo", "systemctl", "enable", "--now", "quaestio.service"], silent=True)
@@ -769,8 +799,9 @@ fi
   <key>StandardErrorPath</key><string>{os.path.join(INSTALL_DIR, 'host.err.log')}</string>
 </dict></plist>
 ''')
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", plist], capture_output=True)
-    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist], capture_output=True)
+    _uid = getattr(os, "getuid", lambda: 0)()
+    subprocess.run(["launchctl", "bootout", f"gui/{_uid}", plist], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{_uid}", plist], capture_output=True)
     return f"autostart on login installed ({plist})"
 
 
@@ -904,7 +935,7 @@ def _step_pool():
 def _step_web():
     if not cfg.web:
         return "skipped (web panel not requested)"
-    base = os.environ.get("QUAESTIO_SRC", "https://raw.githubusercontent.com/fishesarethings/quaestio-admin/main")
+    base = os.environ.get("QUAESTIO_SRC", "https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/dashboard")
     os.makedirs(os.path.join(DASH_DIR, "static"), exist_ok=True)
     for f in ("app.py", "requirements.txt"):
         _run(["curl", "-fsSL", f"{base}/{f}", "-o", os.path.join(DASH_DIR, f)], silent=True)
@@ -981,7 +1012,6 @@ class Installer(App):
     """
     BINDINGS = [
         ("ctrl+q", "quit_installer", "Quit"),
-        ("escape", "switch_screen('start')", "Start"),
     ]
 
     def __init__(self):
