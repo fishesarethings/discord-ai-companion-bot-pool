@@ -1062,6 +1062,21 @@ async def pool_health_loop():
                 pass
 
 
+def cmd_tick(name: str):
+    """Count one slash-command invocation for public stats (fire-and-forget)."""
+    try:
+        conn = db()
+        conn.execute(
+            """INSERT INTO cmdlog (name, calls) VALUES (?, 1)
+               ON CONFLICT(name) DO UPDATE SET calls = calls + 1""",
+            (str(name),),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 def usage_bucket(window: int) -> str:
     """Rolling bucket key: hour, 6-hour block, or calendar day."""
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -1971,6 +1986,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 
 @bot.tree.command(name="ping", description="Check the bot's latency.")
 async def ping(interaction: discord.Interaction):
+    cmd_tick("ping")
     await interaction.response.send_message(
         f"🏓 Pong! `{round(bot.latency * 1000)}ms`", ephemeral=True
     )
@@ -1978,6 +1994,7 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="uptime", description="How long has the bot been running?")
 async def uptime(interaction: discord.Interaction):
+    cmd_tick("uptime")
     secs = int(time.time() - START_TIME)
     days, rem = divmod(secs, 86400)
     hours, rem = divmod(rem, 3600)
@@ -1989,6 +2006,7 @@ async def uptime(interaction: discord.Interaction):
 
 @bot.tree.command(name="about", description="What is Quaestio?")
 async def about(interaction: discord.Interaction):
+    cmd_tick("about")
     embed = discord.Embed(
         title="Quaestio",
         description=(
@@ -2003,6 +2021,7 @@ async def about(interaction: discord.Interaction):
 
 @bot.tree.command(name="invite", description="Invite Quaestio to another server.")
 async def invite(interaction: discord.Interaction):
+    cmd_tick("invite")
     await interaction.response.defer(thinking=False, ephemeral=True)
     try:
         app = await bot.application_info()
@@ -2076,6 +2095,7 @@ def _command_groups() -> list:
 
 @bot.tree.command(name="help", description="Learn what Quaestio can do.")
 async def help_cmd(interaction: discord.Interaction):
+    cmd_tick("help_cmd")
     embed = discord.Embed(
         title="🛠️ Quaestio commands",
         description=(
@@ -2094,6 +2114,7 @@ async def help_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="userinfo", description="Look up a member's profile.")
 @app_commands.describe(member="Which member? Defaults to you.")
 async def userinfo(interaction: discord.Interaction, member: discord.Member = None):
+    cmd_tick("userinfo")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/userinfo` inside a server.", ephemeral=True)
         return
@@ -2123,6 +2144,7 @@ async def userinfo(interaction: discord.Interaction, member: discord.Member = No
 
 @bot.tree.command(name="serverinfo", description="See stats about this server.")
 async def serverinfo(interaction: discord.Interaction):
+    cmd_tick("serverinfo")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/serverinfo` inside a server.", ephemeral=True)
         return
@@ -2150,6 +2172,7 @@ async def serverinfo(interaction: discord.Interaction):
 @bot.tree.command(name="avatar", description="Show a member's profile picture.")
 @app_commands.describe(member="Which member? Defaults to you.")
 async def avatar(interaction: discord.Interaction, member: discord.Member = None):
+    cmd_tick("avatar")
     member = member or interaction.user
     embed = discord.Embed(title=f"{member.display_name} 📸", color=0xA78BFA)
     embed.set_image(url=member.display_avatar.url)
@@ -2229,6 +2252,7 @@ class PollButton(discord.ui.Button):
     options="Comma-separated options, e.g. 'Yes, No' (2-9, default Yes/No)",
 )
 async def poll(interaction: discord.Interaction, question: str, options: str = ""):
+    cmd_tick("poll")
     opts = [o.strip() for o in options.split(",") if o.strip()]
     if not opts:
         opts = ["Yes", "No"]
@@ -2272,6 +2296,7 @@ async def reminder_loop():
 @bot.tree.command(name="remind", description="Get pinged about something later.")
 @app_commands.describe(what="What to remind you about", minutes="In how many minutes (1-1440)")
 async def remind(interaction: discord.Interaction, what: str, minutes: int):
+    cmd_tick("remind")
     minutes = max(1, min(minutes, 1440))
     channel_id = interaction.channel.id if interaction.guild else interaction.user.id
     _reminders.append({
@@ -2289,6 +2314,7 @@ async def remind(interaction: discord.Interaction, what: str, minutes: int):
 @bot.tree.command(name="8ball", description="Ask the magic 8-ball a question.")
 @app_commands.describe(question="Your question")
 async def eightball(interaction: discord.Interaction, question: str):
+    cmd_tick("eightball")
     answers = [
         "🎱 It is certain.", "🎱 It is decidedly so.", "🎱 Without a doubt.",
         "🎱 Yes — definitely.", "🎱 You may rely on it.", "🎱 As I see it, yes.",
@@ -2309,6 +2335,7 @@ async def eightball(interaction: discord.Interaction, question: str):
 
 @bot.tree.command(name="dice", description="Roll some dice. Defaults to 1d6.")
 async def dice(interaction: discord.Interaction, dice: str = "1d6"):
+    cmd_tick("dice")
     m = re.fullmatch(r"(\d*)d(\d+)", dice.strip().lower())
     if not m:
         await interaction.response.send_message("Try something like `2d6` or `1d20`.", ephemeral=True)
@@ -2329,6 +2356,7 @@ async def dice(interaction: discord.Interaction, dice: str = "1d6"):
 
 @bot.tree.command(name="coin", description="Flip a coin.")
 async def coin(interaction: discord.Interaction):
+    cmd_tick("coin")
     result = random.choice(["Heads", "Tails"])
     await interaction.response.send_message(f"🪙 **{interaction.user.display_name}** flipped **{result}**!")
 
@@ -2341,6 +2369,7 @@ async def coin(interaction: discord.Interaction):
     app_commands.Choice(name="✂️ Scissors", value="scissors"),
 ])
 async def rps(interaction: discord.Interaction, choice: str):
+    cmd_tick("rps")
     bot_choice = random.choice(["rock", "paper", "scissors"])
     emoji = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
     wins = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
@@ -2380,6 +2409,7 @@ _trivia_answer_at = {}
 
 @bot.tree.command(name="trivia", description="Answer a random trivia question.")
 async def trivia(interaction: discord.Interaction):
+    cmd_tick("trivia")
     question, answer = random.choice(_TRIVIA)
     key = (interaction.guild.id if interaction.guild else "dm", interaction.channel.id)
     _trivia_answer_at[key] = (answer, time.time())
@@ -2390,6 +2420,7 @@ async def trivia(interaction: discord.Interaction):
 
 @bot.tree.command(name="answer", description="Answer the running trivia question.")
 async def answer(interaction: discord.Interaction, answer_text: str):
+    cmd_tick("answer")
     key = (interaction.guild.id if interaction.guild else "dm", interaction.channel.id)
     entry = _trivia_answer_at.get(key)
     if not entry:
@@ -2418,6 +2449,7 @@ _SLOT_SYMBOLS = ["🍒", "🍋", "🍉", "⭐", "💎", "7️⃣"]
 
 @bot.tree.command(name="slot", description="Spin the slot machine.")
 async def slot(interaction: discord.Interaction):
+    cmd_tick("slot")
     roll = [random.choice(_SLOT_SYMBOLS) for _ in range(3)]
     line = "".join(roll)
     if roll[0] == roll[1] == roll[2]:
@@ -2462,6 +2494,7 @@ def _winner_of(board):
 @bot.tree.command(name="tictactoe", description="Play tic-tac-toe (X) against a friend (O).")
 @app_commands.describe(opponent="The friend you want to play against")
 async def tictactoe(interaction: discord.Interaction, opponent: discord.Member):
+    cmd_tick("tictactoe")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/tictactoe` inside a server.", ephemeral=True)
         return
@@ -2492,6 +2525,7 @@ async def tictactoe(interaction: discord.Interaction, opponent: discord.Member):
 @bot.tree.command(name="move", description="Play a square in the running tic-tac-toe game (1–9).")
 @app_commands.describe(cell="Square number 1–9 (top-left to bottom-right)")
 async def move(interaction: discord.Interaction, cell: int):
+    cmd_tick("move")
     if interaction.guild is None:
         await interaction.response.send_message("Only in servers.", ephemeral=True)
         return
@@ -2569,6 +2603,7 @@ async def ai_model_autocomplete(interaction: discord.Interaction, current: str):
 @app_commands.describe(model="Pick from models on your configured AI host, or 'default'")
 @app_commands.autocomplete(model=ai_model_autocomplete)
 async def ai_model_selector(interaction: discord.Interaction, model: str):
+    cmd_tick("ai_model_selector")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ai model` inside a server.", ephemeral=True)
         return
@@ -2586,6 +2621,7 @@ async def ai_model_selector(interaction: discord.Interaction, model: str):
 @AI_GROUP.command(name="toggle", description="Enable or disable AI chat on this server.")
 @app_commands.describe(enabled="true to enable, false to disable")
 async def ai_toggle(interaction: discord.Interaction, enabled: bool):
+    cmd_tick("ai_toggle")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ai toggle` inside a server.", ephemeral=True)
         return
@@ -2620,6 +2656,7 @@ async def _character_ac(interaction: discord.Interaction, current: str):
 @app_commands.describe(name="Personality name, or 'none'")
 @app_commands.autocomplete(name=_personality_ac)
 async def ai_personality(interaction: discord.Interaction, name: str):
+    cmd_tick("ai_personality")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ai personality` inside a server.", ephemeral=True)
         return
@@ -2642,6 +2679,7 @@ async def ai_personality(interaction: discord.Interaction, name: str):
 @app_commands.describe(name="Character name, or 'none'")
 @app_commands.autocomplete(name=_character_ac)
 async def ai_character(interaction: discord.Interaction, name: str):
+    cmd_tick("ai_character")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ai character` inside a server.", ephemeral=True)
         return
@@ -2662,6 +2700,7 @@ async def ai_character(interaction: discord.Interaction, name: str):
 
 @AI_GROUP.command(name="status", description="Show this server's AI settings.")
 async def ai_status(interaction: discord.Interaction):
+    cmd_tick("ai_status")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ai status` inside a server.", ephemeral=True)
         return
@@ -2707,6 +2746,7 @@ async def ai_status(interaction: discord.Interaction):
 
 @AI_GROUP.command(name="clear", description="Forget this channel's conversation memory.")
 async def ai_clear(interaction: discord.Interaction):
+    cmd_tick("ai_clear")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ai clear` inside a server channel.", ephemeral=True)
         return
@@ -2719,6 +2759,7 @@ async def ai_clear(interaction: discord.Interaction):
 
 @bot.tree.command(name="pool", description="See the community pool + what contributors earn.")
 async def pool_info(interaction: discord.Interaction):
+    cmd_tick("pool_info")
     """Anonymous pool stats and the contributor perk pitch (no identities)."""
     await interaction.response.defer(thinking=False, ephemeral=True)
     try:
@@ -2762,6 +2803,7 @@ def _remember_reply(interaction, answer, prompt):
 @bot.tree.command(name="ask", description="Chat with Quaestio's local AI.")
 @app_commands.describe(prompt="What you want to say or ask")
 async def ask(interaction: discord.Interaction, prompt: str):
+    cmd_tick("ask")
     if interaction.guild is None:
         await interaction.response.defer(thinking=False)
         try:
@@ -2861,6 +2903,7 @@ PANEL_URL = os.environ.get("PANEL_URL", "https://admin.quaestio.online")
 
 @bot.tree.command(name="panel", description="Open this server's web settings panel.")
 async def panel(interaction: discord.Interaction):
+    cmd_tick("panel")
     await interaction.response.send_message(
         "🛠️ **Quaestio web panel**\n"
         f"⚙️ Settings: {PANEL_URL}\n"
@@ -2873,6 +2916,7 @@ async def panel(interaction: discord.Interaction):
 
 @bot.tree.command(name="site", description="Quaestio on the web: docs, pool, and source.")
 async def site_cmd(interaction: discord.Interaction):
+    cmd_tick("site_cmd")
     await interaction.response.send_message(
         "🌐 **Quaestio on the web**\n"
         "📖 Main site: https://quaestio.online\n"
@@ -2885,6 +2929,7 @@ async def site_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="contribute", description="How to lend compute to the community pool.")
 async def contribute_cmd(interaction: discord.Interaction):
+    cmd_tick("contribute_cmd")
     await interaction.response.send_message(
         "⚡ **Lend spare AI compute**\n"
         "Run `quaestio pool-serve` (or host in your browser at "
@@ -2897,6 +2942,7 @@ async def contribute_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="summarize", description="Summarize the last N messages in this channel.")
 @app_commands.describe(limit="How many messages to summarize (default 20, max 60)")
 async def summarize(interaction: discord.Interaction, limit: int = 20):
+    cmd_tick("summarize")
     if interaction.guild is None:
         await interaction.response.send_message("Summarize works in a server's channel, not DMs.", ephemeral=True)
         return
@@ -2979,6 +3025,7 @@ bot.tree.add_command(AI_GROUP)
 @bot.tree.command(name="rank", description="Check your XP and level.")
 @app_commands.describe(member="Member to check (defaults to you)")
 async def rank(interaction: discord.Interaction, member: discord.Member = None):
+    cmd_tick("rank")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/rank` inside a server.", ephemeral=True)
         return
@@ -3001,6 +3048,7 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
 @bot.tree.command(name="profile", description="What Quaestio has learned about a member.")
 @app_commands.describe(member="Member to check (defaults to you)")
 async def profile(interaction: discord.Interaction, member: discord.Member = None):
+    cmd_tick("profile")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/profile` inside a server.", ephemeral=True)
         return
@@ -3022,6 +3070,7 @@ async def profile(interaction: discord.Interaction, member: discord.Member = Non
 @bot.tree.command(name="leaderboard", description="Top chatters by XP in this server.")
 @app_commands.describe(top="How many to show (default 10, max 25)")
 async def leaderboard(interaction: discord.Interaction, top: int = 10):
+    cmd_tick("leaderboard")
     if interaction.guild is None:
         await interaction.response.send_message("Leaderboard works inside a server.", ephemeral=True)
         return
@@ -3072,6 +3121,7 @@ def _warn_db(guild_id, user_id, reason):
 @bot.tree.command(name="warn", description="Warn a member.")
 @app_commands.describe(member="Member to warn", reason="Reason")
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+    cmd_tick("warn")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/warn` inside a server.", ephemeral=True)
         return
@@ -3097,6 +3147,7 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
 @bot.tree.command(name="warns", description="List a member's warnings.")
 @app_commands.describe(member="Member to check")
 async def warns(interaction: discord.Interaction, member: discord.Member):
+    cmd_tick("warns")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/warns` inside a server.", ephemeral=True)
         return
@@ -3118,6 +3169,7 @@ async def warns(interaction: discord.Interaction, member: discord.Member):
 @bot.tree.command(name="delwarns", description="Clear all warnings for a member.")
 @app_commands.describe(member="Member to clear")
 async def delwarns(interaction: discord.Interaction, member: discord.Member):
+    cmd_tick("delwarns")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/delwarns` inside a server.", ephemeral=True)
         return
@@ -3137,6 +3189,7 @@ async def delwarns(interaction: discord.Interaction, member: discord.Member):
 @bot.tree.command(name="kick", description="Kick a member.")
 @app_commands.describe(member="Member to kick", reason="Reason")
 async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+    cmd_tick("kick")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/kick` inside a server.", ephemeral=True)
         return
@@ -3157,6 +3210,7 @@ async def kick(interaction: discord.Interaction, member: discord.Member, reason:
 @bot.tree.command(name="ban", description="Ban a member.")
 @app_commands.describe(member="Member to ban", reason="Reason")
 async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+    cmd_tick("ban")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/ban` inside a server.", ephemeral=True)
         return
@@ -3177,6 +3231,7 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
 @bot.tree.command(name="unban", description="Unban a user by name.")
 @app_commands.describe(user="Name of the banned user")
 async def unban(interaction: discord.Interaction, user: str):
+    cmd_tick("unban")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/unban` inside a server.", ephemeral=True)
         return
@@ -3207,6 +3262,7 @@ async def unban(interaction: discord.Interaction, user: str):
 @bot.tree.command(name="purge", description="Bulk-delete recent messages.")
 @app_commands.describe(count="How many to delete (max 100)")
 async def purge(interaction: discord.Interaction, count: int = 20):
+    cmd_tick("purge")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/purge` inside a server.", ephemeral=True)
         return
@@ -3228,6 +3284,7 @@ async def purge(interaction: discord.Interaction, count: int = 20):
 @bot.tree.command(name="mute", description="Timeout a member.")
 @app_commands.describe(member="Member to mute", minutes="How many minutes", reason="Reason")
 async def mute(interaction: discord.Interaction, member: discord.Member, minutes: int = 10, reason: str = "No reason"):
+    cmd_tick("mute")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/mute` inside a server.", ephemeral=True)
         return
@@ -3252,6 +3309,7 @@ async def mute(interaction: discord.Interaction, member: discord.Member, minutes
 @bot.tree.command(name="unmute", description="Remove a timeout.")
 @app_commands.describe(member="Member to unmute")
 async def unmute(interaction: discord.Interaction, member: discord.Member):
+    cmd_tick("unmute")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/unmute` inside a server.", ephemeral=True)
         return
@@ -3273,6 +3331,7 @@ async def unmute(interaction: discord.Interaction, member: discord.Member):
 @bot.tree.command(name="tag", description="Show a saved tag.")
 @app_commands.describe(name="Tag name")
 async def tag(interaction: discord.Interaction, name: str):
+    cmd_tick("tag")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/tag` inside a server.", ephemeral=True)
         return
@@ -3291,6 +3350,7 @@ async def tag(interaction: discord.Interaction, name: str):
 @bot.tree.command(name="tagcreate", description="Create a tag.")
 @app_commands.describe(name="Tag name", content="Tag content")
 async def tagcreate(interaction: discord.Interaction, name: str, content: str):
+    cmd_tick("tagcreate")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/tagcreate` inside a server.", ephemeral=True)
         return
@@ -3316,6 +3376,7 @@ async def tagcreate(interaction: discord.Interaction, name: str, content: str):
 @bot.tree.command(name="tagdelete", description="Delete a tag.")
 @app_commands.describe(name="Tag name")
 async def tagdelete(interaction: discord.Interaction, name: str):
+    cmd_tick("tagdelete")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/tagdelete` inside a server.", ephemeral=True)
         return
@@ -3337,6 +3398,7 @@ async def tagdelete(interaction: discord.Interaction, name: str):
 
 @bot.tree.command(name="tags", description="List all tags in this server.")
 async def tags(interaction: discord.Interaction):
+    cmd_tick("tags")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/tags` inside a server.", ephemeral=True)
         return
@@ -3364,6 +3426,7 @@ bot.tree.add_command(BDAY_GROUP)
 @BDAY_GROUP.command(name="set", description="Save your birthday (month/day).")
 @app_commands.describe(month="Birth month (1-12)", day="Birth day (1-31)")
 async def bday_set(interaction: discord.Interaction, month: int, day: int):
+    cmd_tick("bday_set")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/birthday set` inside a server.", ephemeral=True)
         return
@@ -3387,6 +3450,7 @@ async def bday_set(interaction: discord.Interaction, month: int, day: int):
 
 @BDAY_GROUP.command(name="remove", description="Remove your birthday.")
 async def bday_remove(interaction: discord.Interaction):
+    cmd_tick("bday_remove")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/birthday remove` inside a server.", ephemeral=True)
         return
