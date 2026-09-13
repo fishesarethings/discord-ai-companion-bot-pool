@@ -347,7 +347,19 @@ class Connections(_NavScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         cfg.endpoint_mode = self.query_one("#mode", Select).value
-        cfg.remote_endpoint = self.query_one("#remote", Input).value.strip()
+        raw = self.query_one("#remote", Input).value.strip().rstrip("/")
+        if cfg.endpoint_mode == "remote":
+            import urllib.parse as _up
+            try:
+                u = _up.urlparse(raw if "://" in raw else "http://" + raw)
+                assert u.hostname and u.scheme in ("http", "https")
+                raw = f"{u.scheme}://{u.hostname}" + (f":{u.port}" if u.port else "")
+            except Exception:
+                self.notify("That URL doesn't look valid — use http://host:11434.", severity="error")
+                return
+            cfg.remote_endpoint = raw
+        else:
+            cfg.remote_endpoint = ""
         cfg.model = self.query_one("#model", Select).value or cfg.model
         if event.button.id == "back":
             self.app.switch_screen("location")
@@ -794,7 +806,7 @@ fi
   <key>Label</key><string>com.quaestio.host</string>
   <key>ProgramArguments</key><array><string>{run_host}</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
+  <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>{os.path.join(INSTALL_DIR, 'host.log')}</string>
   <key>StandardErrorPath</key><string>{os.path.join(INSTALL_DIR, 'host.err.log')}</string>
 </dict></plist>
@@ -902,7 +914,7 @@ def _pool_join_remote(broker: str, join_key: str, endpoint: str, model: str, sha
     verb = "updated" if data.get("new") is False else "joined"
     return f"{verb} the community pool as {data.get('name', 'node-????')} ({share}%) — requests now route to you"
 
-POOL_BROKER = os.environ.get("POOL_BROKER_URL") or "https://admin.quaestio.online"
+POOL_BROKER = os.environ.get("POOL_BROKER_URL") or "https://pool.quaestio.online"
 
 
 def _step_pool():

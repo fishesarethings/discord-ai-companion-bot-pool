@@ -230,10 +230,16 @@ def update():
     for f in ("bot.py", "config.py", "requirements.txt", ".env.example", "quaestio.py",
               "install_wizard.py", "install.sh", "install.ps1"):
         dest = os.path.join(BOT_DIR, f)
+        tmp = dest + ".dl"
         before = _hl.sha256(open(dest, "rb").read()).hexdigest() if os.path.isfile(dest) else ""
-        r = subprocess.run(["curl", "-fsSL", f"{base}/{f}", "-o", dest])
-        if r.returncode != 0:
+        r = subprocess.run(["curl", "-fsSL", f"{base}/{f}", "-o", tmp])
+        if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             boom(f"Update failed downloading {f} — keeping the old copy.")
+        os.replace(tmp, dest)
         after = _hl.sha256(open(dest, "rb").read()).hexdigest()
         changed = changed or (before != after)
     subprocess.run([venv_python(), "-m", "pip", "install", "--quiet",
@@ -343,7 +349,11 @@ def status():
     model = read_env("OLLAMA_MODEL")
     endpoint = read_env("OLLAMA_BASE_URL")
     if model:
-        say(f"Model: {model} · Endpoint: {endpoint}")
+        _mods = _probe_ollama_models("http://127.0.0.1:11434")
+        if _mods:
+            say(f"Model: {model} · Endpoint: {endpoint} · Ollama up ({len(_mods)} models)", GREEN)
+        else:
+            say(f"Model: {model} · Endpoint: {endpoint} · Ollama DOWN — start it (`ollama serve`)", YELLOW)
     token = read_env("BOT_TOKEN")
     say("Bot token configured: " + ("yes (hidden)" if token else "no — run `settings`"), GREEN if token else YELLOW)
     if read_env("POOL_NODE_SECRET"):
@@ -556,6 +566,8 @@ def rename():
         boom("This box isn't in the pool yet. Join with:  quaestio contribute")
     r = _pool_json(_broker_url().rstrip("/") + "/api/pool/rename", {"node_secret": node_secret})
     if "error" in r:
+        if "Unknown node" in r["error"]:
+            boom(f"Couldn't rename ({r['error']}). Re-join with:  quaestio contribute")
         boom(f"Couldn't rename ({r['error']}).")
     say(f"You're now {r['name']} — served count carried over. Next change in {r.get('next_change_days', 7)} days.", GREEN)
 
