@@ -62,11 +62,21 @@ keyfile() {
     local genpy="$VENV/bin/python"
     [[ -x "$genpy" ]] || genpy="python3"
     if [[ "$(uname -s)" == "Linux" ]]; then
-      sudo mkdir -p "$(dirname "$keyfile")"
-      sudo "$genpy" -c "from cryptography.fernet import Fernet; open('$keyfile','wb').write(Fernet.generate_key())"
-      # Root-owned 0600 would lock out the service user — hand it over.
-      sudo chown "$USER:$USER" "$keyfile"
-      sudo chmod 600 "$keyfile"
+      if ! command -v sudo >/dev/null 2>&1; then
+        keyfile="$HOME/.quaestio/keyfile"
+        warn "No sudo — using $keyfile instead of /etc/quaestio/keyfile."
+      fi
+      if [[ "$keyfile" == /etc/* ]]; then
+        sudo mkdir -p "$(dirname "$keyfile")"
+        sudo "$genpy" -c "from cryptography.fernet import Fernet; open('$keyfile','wb').write(Fernet.generate_key())"
+        # Root-owned 0600 would lock out the service user — hand it over.
+        sudo chown "${SUDO_USER:-$USER}:${SUDO_USER:-$USER}" "$keyfile"
+        sudo chmod 600 "$keyfile"
+      else
+        mkdir -p "$(dirname "$keyfile")"
+        "$genpy" -c "from cryptography.fernet import Fernet; open('$keyfile','wb').write(Fernet.generate_key())"
+        chmod 600 "$keyfile"
+      fi
     else
       mkdir -p "$(dirname "$keyfile")"
       "$genpy" -c "from cryptography.fernet import Fernet; open('$keyfile','wb').write(Fernet.generate_key())"
@@ -107,32 +117,33 @@ VENV="$INSTALL_DIR/.venv"
 BOT_DIR="$INSTALL_DIR/bot"
 mkdir -p "$BOT_DIR"
 
+_fetch() { curl -fsSL "$1" -o "$2.tmp" && mv "$2.tmp" "$2"; }  # atomic: never half-write
 if [[ ! -f "$BOT_DIR/bot.py" ]]; then
   say "Downloading Quaestio bot code…"
   BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
-  curl -fsSL "$BASE/bot.py" -o "$BOT_DIR/bot.py" || die "Could not download bot.py (check your network)."
-  curl -fsSL "$BASE/config.py" -o "$BOT_DIR/config.py" || warn "Could not download config.py."
-  curl -fsSL "$BASE/quaestio.py" -o "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
-  curl -fsSL "$BASE/install_wizard.py" -o "$BOT_DIR/install_wizard.py" || warn "Could not download the install wizard."
-  curl -fsSL "$BASE/requirements.txt" -o "$BOT_DIR/requirements.txt"
-  curl -fsSL "$BASE/.env.example" -o "$BOT_DIR/.env.example" || true
+  _fetch "$BASE/bot.py" "$BOT_DIR/bot.py" || die "Could not download bot.py (check your network)."
+  _fetch "$BASE/config.py" "$BOT_DIR/config.py" || warn "Could not download config.py."
+  _fetch "$BASE/quaestio.py" "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
+  _fetch "$BASE/install_wizard.py" "$BOT_DIR/install_wizard.py" || warn "Could not download the install wizard."
+  _fetch "$BASE/requirements.txt" "$BOT_DIR/requirements.txt"
+  _fetch "$BASE/.env.example" "$BOT_DIR/.env.example" || true
 else
   say "Bot code already present at $BOT_DIR — skipping download."
   # Make sure config.py exists too (added in a later version)
   if [[ ! -f "$BOT_DIR/config.py" ]]; then
     say "Fetching config.py…"
     BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
-    curl -fsSL "$BASE/config.py" -o "$BOT_DIR/config.py" || warn "Could not download config.py."
+    _fetch "$BASE/config.py" "$BOT_DIR/config.py" || warn "Could not download config.py."
   fi
   if [[ ! -f "$BOT_DIR/quaestio.py" ]]; then
     say "Fetching the manage tool (quaestio.py)…"
     BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
-    curl -fsSL "$BASE/quaestio.py" -o "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
+    _fetch "$BASE/quaestio.py" "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
   fi
   # The wizard gets refreshed on every run so fixes/tweaks reach you instantly.
   say "Fetching the latest install wizard…"
   BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
-  curl -fsSL "$BASE/install_wizard.py" -o "$BOT_DIR/install_wizard.py" || warn "Could not download the install wizard."
+  _fetch "$BASE/install_wizard.py" "$BOT_DIR/install_wizard.py" || warn "Could not download the install wizard."
 fi
 chmod +x "$BOT_DIR/quaestio.py" 2>/dev/null || true
 
@@ -242,6 +253,10 @@ EOF
     done
     export PATH="$target:$PATH"
     hash -r 2>/dev/null || true
+    if [[ -n "${FISH_VERSION:-}" ]] || [[ "$(basename "${SHELL:-}")" == "fish" ]]; then
+      mkdir -p ~/.config/fish 2>/dev/null || true
+      fish_add_path "$target" 2>/dev/null || echo "set -gx PATH $target \$PATH" >> ~/.config/fish/config.fish
+    fi
     say "Added $target to your PATH (shell startup file updated — \`quaestio\` works now and in new terminals)."
   fi
 }
@@ -269,6 +284,16 @@ if ! command -v ollama >/dev/null 2>&1; then
   fi
 fi
 if command -v ollama >/dev/null 2>&1; then
+  if ! ollama list 2>/dev/null | grep -qi .; then
+    say "Starting Ollama so models can load…"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      (open -a Ollama 2>/dev/null || nohup ollama serve >/dev/null 2>&1 &) ; sleep 3
+    elif command -v systemctl >/dev/null 2>&1; then
+      (sudo systemctl enable --now ollama 2>/dev/null || nohup ollama serve >/dev/null 2>&1 &) ; sleep 3
+    else
+      (nohup ollama serve >/dev/null 2>&1 &) ; sleep 3
+    fi
+  fi
   if ! ollama list 2>/dev/null | grep -qi "$MODEL"; then
     say "Pulling a small smart AI model ($MODEL, ~1 GB download) — first run takes a minute or two."
     ollama pull "$MODEL" || warn "Model pull failed; you can run 'ollama pull $MODEL' later."
@@ -330,7 +355,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$VENV/bin/python $BOT_DIR/bot.py
 Restart=on-failure
 RestartSec=5
-User=$USER
+User=${SUDO_USER:-$USER}
 
 [Install]
 WantedBy=multi-user.target

@@ -410,6 +410,8 @@ def get_cfg(guild_id, key, default=None):
 
 def get_all_cfg(guild_id, keys, defaults=None):
     """Batch-fetch config keys in one round-trip (per-message hot path)."""
+    if not keys:
+        return dict(defaults or {})
     defaults = defaults or {}
     conn = db()
     try:
@@ -434,10 +436,14 @@ def set_cfg(guild_id, key, value):
     conn.close()
 
 
+def _flag_val(v, default="1") -> bool:
+    """Single truthy rule everywhere: empty means default, never False-by-accident."""
+    return str(v if v not in (None, "") else default).strip().lower() not in ("", "0", "false", "none")
+
+
 def flag_on(guild_id, key, default="1") -> bool:
     """Truthy config check that tolerates '1'/'0', 'True'/'False' and empty."""
-    v = str(get_cfg(guild_id, key, default)).strip().lower()
-    return v not in ("", "0", "false", "none")
+    return _flag_val(get_cfg(guild_id, key, default), default)
 
 
 # ---------------------------------------------------------------------------
@@ -553,10 +559,14 @@ async def ask_ollama_any(cfg, prompt: str, temperature: float = 0.6, max_tokens:
 
 def _is_no_compute(exc: Exception) -> bool:
     """True when nothing could answer (no backends / all offline) as opposed
-    to a slow box timing out — the former gets the contributor nudge."""
+    to a slow box timing out — the former gets the contributor nudge.
+    Timeouts/busy stay on the retry path, never the nudge."""
     msg = str(exc).lower()
+    if "took too long" in msg or "timed out" in msg or "busy" in msg:
+        return False
     return ("no compute available" in msg or "no model box replied" in msg
-            or "isn't reachable" in msg or "is offline" in msg)
+            or "isn't reachable" in msg or "is offline" in msg
+            or "empty reply" in msg or "isn't installed" in msg)
 
 
 NO_COMPUTE_NOTICE = ("⚠️ No compute available right now — all AI boxes are busy or offline.\n"
@@ -617,8 +627,7 @@ def guild_ai_config(guild_id):
     _pers = (g.get("ai_personality") or "none")
     _char = (g.get("ai_character") or "")
 
-    def _flag(v, default="1"):
-        return str(v if v not in (None, "") else default).strip().lower() not in ("", "0", "false", "none")
+    _flag = _flag_val
 
     base = {
         "model": g.get("ai_model") or host("ai_model", OLLAMA_MODEL),
@@ -690,7 +699,7 @@ def guild_ai_config(guild_id):
 
 def channel_allowed(guild_id, channel_id, cfg) -> bool:
     """True if the channel is on the server's AI allowlist (empty list = all)."""
-    raw = (get_cfg(guild_id, "ai_channels", "") or "").strip()
+    raw = (cfg.get("ai_channels", "") if isinstance(cfg, dict) else get_cfg(guild_id, "ai_channels", "") or "").strip()
     if not raw:
         return True
     allowed = {c.strip() for c in raw.split(",") if c.strip()}
@@ -2145,7 +2154,7 @@ def _command_groups() -> list:
 
 @bot.tree.command(name="help", description="Learn what Quaestio can do.")
 async def help_cmd(interaction: discord.Interaction):
-    cmd_tick("help_cmd")
+    cmd_tick("help")
     embed = discord.Embed(
         title="🛠️ Quaestio commands",
         description=(
@@ -2226,8 +2235,7 @@ async def avatar(interaction: discord.Interaction, member: discord.Member = None
     member = member or interaction.user
     embed = discord.Embed(title=f"{member.display_name} 📸", color=0xA78BFA)
     embed.set_image(url=member.display_avatar.url)
-    embed.add_field(name="Avatar URL", value=member.display_avatar.url, inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2364,7 +2372,7 @@ async def remind(interaction: discord.Interaction, what: str, minutes: int):
 @bot.tree.command(name="8ball", description="Ask the magic 8-ball a question.")
 @app_commands.describe(question="Your question")
 async def eightball(interaction: discord.Interaction, question: str):
-    cmd_tick("eightball")
+    cmd_tick("8ball")
     answers = [
         "🎱 It is certain.", "🎱 It is decidedly so.", "🎱 Without a doubt.",
         "🎱 Yes — definitely.", "🎱 You may rely on it.", "🎱 As I see it, yes.",
@@ -2509,7 +2517,7 @@ async def slot(interaction: discord.Interaction):
             verdict = "✨ **BIG WIN!** Sparkling diamonds!"
         else:
             verdict = "🎉 **WINNER!** Triple match!"
-    elif roll[0] == roll[1] or roll[1] == roll[2]:
+    elif roll[0] == roll[1] or roll[1] == roll[2] or roll[0] == roll[2]:
         verdict = "👍 Close — two in a row!"
     else:
         verdict = "😅 No luck this time."
@@ -2520,7 +2528,7 @@ _BOARD_EMOJI = {"x": "❌", "o": "⭕", "": "·"}
 _games = {}
 
 
-def _board_view(board, show) -> str:
+def _board_view(board, show=True) -> str:
     return "```\n" + "\n".join(
         " ".join(_BOARD_EMOJI[k if show else ""] for k in board[y * 3:(y + 1) * 3])
         for y in range(3)
@@ -2809,9 +2817,9 @@ async def ai_clear(interaction: discord.Interaction):
 
 @bot.tree.command(name="pool", description="See the community pool + what contributors earn.")
 async def pool_info(interaction: discord.Interaction):
-    cmd_tick("pool_info")
+    cmd_tick("pool")
     """Anonymous pool stats and the contributor perk pitch (no identities)."""
-    await interaction.response.defer(thinking=False, ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         nodes = pool_candidates("", limit=8)
         total = pool_total_share()
@@ -2966,7 +2974,7 @@ async def panel(interaction: discord.Interaction):
 
 @bot.tree.command(name="site", description="Quaestio on the web: docs, pool, and source.")
 async def site_cmd(interaction: discord.Interaction):
-    cmd_tick("site_cmd")
+    cmd_tick("site")
     await interaction.response.send_message(
         "🌐 **Quaestio on the web**\n"
         "📖 Main site: https://quaestio.online\n"
@@ -2979,7 +2987,7 @@ async def site_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="contribute", description="How to lend compute to the community pool.")
 async def contribute_cmd(interaction: discord.Interaction):
-    cmd_tick("contribute_cmd")
+    cmd_tick("contribute")
     await interaction.response.send_message(
         "⚡ **Lend spare AI compute**\n"
         "Run `quaestio pool-serve` (or host in your browser at "
@@ -3013,6 +3021,12 @@ async def summarize(interaction: discord.Interaction, limit: int = 20):
         )
         return
     limit = max(1, min(limit, 60))
+    if not quota_ok(interaction.guild.id, cfg["quota"], cfg["window"]):
+        await interaction.response.send_message(
+            "⚠️ This server has hit its AI quota for this hour (set in the dashboard).",
+            ephemeral=True,
+        )
+        return
     await interaction.response.defer(thinking=False)
     texts = []
     async for msg in interaction.channel.history(limit=limit):
@@ -3290,7 +3304,7 @@ async def unban(interaction: discord.Interaction, user: str):
     if not is_admin(interaction.user):
         await interaction.response.send_message("Needs Administrator.", ephemeral=True)
         return
-    await interaction.response.defer(thinking=False, ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         banned = [entry async for entry in interaction.guild.bans()]
     except (discord.Forbidden, discord.HTTPException):
@@ -3308,7 +3322,7 @@ async def unban(interaction: discord.Interaction, user: str):
     except (discord.Forbidden, discord.HTTPException, discord.NotFound):
         await interaction.followup.send("Unban failed.", ephemeral=True)
         return
-    await interaction.followup.send(f"🔓 Unbanned {target.user}.")
+    await interaction.followup.send(f"🔓 Unbanned {target.user}.", ephemeral=True)
 
 
 @bot.tree.command(name="purge", description="Bulk-delete recent messages.")
@@ -3322,7 +3336,7 @@ async def purge(interaction: discord.Interaction, count: int = 20):
         await interaction.response.send_message("Needs Administrator.", ephemeral=True)
         return
     count = max(1, min(count, 100))
-    await interaction.response.defer(thinking=False, ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         deleted = await interaction.channel.purge(limit=count)
     except (discord.Forbidden, discord.HTTPException):
@@ -3354,7 +3368,7 @@ async def mute(interaction: discord.Interaction, member: discord.Member, minutes
         await interaction.response.send_message("Mute failed — check my role position.", ephemeral=True)
         return
     await interaction.response.send_message(
-        f"🔇 Timed out {member.display_name} for {duration.days * 24 + duration.seconds // 3600}h ({reason})"
+        f"🔇 Timed out {member.display_name} for {max(1, int(duration.total_seconds() // 60))}m ({reason})"
     )
 
 
@@ -3478,7 +3492,7 @@ bot.tree.add_command(BDAY_GROUP)
 @BDAY_GROUP.command(name="set", description="Save your birthday (month/day).")
 @app_commands.describe(month="Birth month (1-12)", day="Birth day (1-31)")
 async def bday_set(interaction: discord.Interaction, month: int, day: int):
-    cmd_tick("bday_set")
+    cmd_tick("birthday")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/birthday set` inside a server.", ephemeral=True)
         return
@@ -3518,6 +3532,7 @@ async def bday_remove(interaction: discord.Interaction):
 
 @BDAY_GROUP.command(name="list", description="Everyone's saved birthdays.")
 async def bday_list(interaction: discord.Interaction):
+    cmd_tick("birthday")
     if interaction.guild is None:
         await interaction.response.send_message("Use `/birthday list` inside a server.", ephemeral=True)
         return
