@@ -120,7 +120,7 @@ mkdir -p "$BOT_DIR"
 _fetch() { curl -fsSL "$1" -o "$2.tmp" && mv "$2.tmp" "$2"; }  # atomic: never half-write
 if [[ ! -f "$BOT_DIR/bot.py" ]]; then
   say "Downloading Quaestio bot code…"
-  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
+  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-website/main/bot}"
   _fetch "$BASE/bot.py" "$BOT_DIR/bot.py" || die "Could not download bot.py (check your network)."
   _fetch "$BASE/config.py" "$BOT_DIR/config.py" || warn "Could not download config.py."
   _fetch "$BASE/quaestio.py" "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
@@ -132,17 +132,17 @@ else
   # Make sure config.py exists too (added in a later version)
   if [[ ! -f "$BOT_DIR/config.py" ]]; then
     say "Fetching config.py…"
-    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
+    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-website/main/bot}"
     _fetch "$BASE/config.py" "$BOT_DIR/config.py" || warn "Could not download config.py."
   fi
   if [[ ! -f "$BOT_DIR/quaestio.py" ]]; then
     say "Fetching the manage tool (quaestio.py)…"
-    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
+    BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-website/main/bot}"
     _fetch "$BASE/quaestio.py" "$BOT_DIR/quaestio.py" || warn "Could not download the manage tool."
   fi
   # The wizard gets refreshed on every run so fixes/tweaks reach you instantly.
   say "Fetching the latest install wizard…"
-  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}"
+  BASE="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-website/main/bot}"
   _fetch "$BASE/install_wizard.py" "$BOT_DIR/install_wizard.py" || warn "Could not download the install wizard."
 fi
 chmod +x "$BOT_DIR/quaestio.py" 2>/dev/null || true
@@ -189,7 +189,7 @@ if [[ -f "$INSTALL_WIZARD" ]] && { [[ -t 0 ]] || [[ -e /dev/tty ]]; } \
     QUAESTIO_MODEL="$MODEL" \
     QUAESTIO_DIR="$INSTALL_DIR" \
     QUAESTIO_KEY_FILE="${QUAESTIO_KEY_FILE:-}" \
-    QUAESTIO_SRC="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-site/main/bot}" \
+    QUAESTIO_SRC="${QUAESTIO_SRC:-https://raw.githubusercontent.com/fishesarethings/quaestio-website/main/bot}" \
       "$VENV/bin/python" "$INSTALL_WIZARD" < /dev/tty && WIZARD_OK=1
   else
     warn "Textual isn't installed in the venv yet — the classic text flow will be used."
@@ -373,11 +373,52 @@ else
   RUN="$INSTALL_DIR/run-quaestio.sh"
   cat > "$RUN" <<EOF
 #!/usr/bin/env bash
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 cd "$BOT_DIR"
 set -a; source .env; set +a
 exec "$VENV/bin/python" "$BOT_DIR/bot.py"
 EOF
   chmod +x "$RUN"
+  # macOS pool hosts: same LaunchAgent the wizard writes (PATH + pool-serve
+  # foreground + KeepAlive + immediate kickstart) so classic installs host too.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    HOST_RUN="$INSTALL_DIR/run-host.sh"
+    cat > "$HOST_RUN" <<EOF
+#!/usr/bin/env bash
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:\$PATH"
+cd "$BOT_DIR" || exit 0
+set -a; [[ -f .env ]] && source .env; set +a
+command -v ollama >/dev/null 2>&1 || exit 0
+pgrep -x ollama >/dev/null 2>&1 || (nohup ollama serve >>"$INSTALL_DIR/host.log" 2>&1 &)
+if grep -q "^POOL_NODE_SECRET=.\\+" .env 2>/dev/null; then
+  if [[ -n "\${BOT_TOKEN:-}" ]]; then
+    nohup "$VENV/bin/python" "$BOT_DIR/quaestio.py" pool-serve >>"$INSTALL_DIR/host.log" 2>&1 &
+    exec "$VENV/bin/python" "$BOT_DIR/bot.py"
+  else
+    exec "$VENV/bin/python" "$BOT_DIR/quaestio.py" pool-serve >>"$INSTALL_DIR/host.log" 2>&1
+  fi
+fi
+if [[ -n "\${BOT_TOKEN:-}" ]]; then
+  exec "$VENV/bin/python" "$BOT_DIR/bot.py"
+fi
+EOF
+    chmod +x "$HOST_RUN"
+    PLIST="$HOME/Library/LaunchAgents/com.quaestio.host.plist"
+    mkdir -p "$(dirname "$PLIST")"
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.quaestio.host</string>
+  <key>ProgramArguments</key><array><string>$HOST_RUN</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+EOF
+    launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/com.quaestio.host" 2>/dev/null || true
+  fi
   say "Done! Start Quaestio with:" 
   say "    $RUN"
   say "(tip: run it from a terminal, or use 'caffeinate -i $RUN' on macOS)."

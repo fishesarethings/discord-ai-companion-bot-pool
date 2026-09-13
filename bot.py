@@ -228,7 +228,10 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # ---------------------------------------------------------------------------
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+    # WAL: readers never block writers. check_same_thread=False: event-loop
+    # threads may use their own connections (one conn per call, never shared).
+    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
     conn.row_factory = sqlite3.Row
     return conn
@@ -841,17 +844,24 @@ def pool_candidates(model="", limit=6):
 
     Scale-safe: healthy/enabled filtering happens in SQL (indexed) and only
     the top candidates are decrypted — a 100k pool costs the same as a tiny
-    one on the per-message path."""
+    one on the per-message path. Stale pull workers (silent past the
+    heartbeat window) are excluded so routing never waits on ghosts."""
     own = (get_cfg("host", "ai_endpoint", OLLAMA_BASE_URL) or "").strip().rstrip("/")
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(seconds=PULL_ONLINE_AFTER)).isoformat()
     n = max(1, min(int(limit or 6), 8))
     conn = db()
     # Over-fetch so model-matching + own-box exclusion still leave enough.
+    # Stale pull workers (silent past the heartbeat window) are excluded —
+    # their endpoints are unreachable, so routing to them only adds latency.
     rows = conn.execute(
-        """SELECT id, name, endpoint, model, share, enabled, failed, down_until, last_ok, last_fail, served
+        """SELECT id, name, endpoint, model, share, enabled, failed, down_until, last_ok, last_fail, served,
+                  pull, last_seen
            FROM hosters WHERE enabled=1 AND (down_until='' OR down_until IS NULL OR down_until<=?)
+           AND (pull=0 OR last_seen>?)
            ORDER BY share DESC, id DESC LIMIT ?""",
-        (now, n * 25),
+        (now, cutoff, n * 25),
     ).fetchall()
     conn.close()
     hosted = []
@@ -894,6 +904,34 @@ def pool_leaders(limit=3):
             (max(1, min(limit, 10)),),
         ).fetchall()
         return [{"name": r["name"], "served": r["served"] or 0, "share": r["share"] or 0}
+                for r in rows]
+    finally:
+        conn.close()
+
+
+def pool_active_nodes(limit=10):
+    """Currently-active pool nodes that respond and listen.
+
+    pull=1 rows with a fresh last_seen are listening (outbound heartbeats);
+    any enabled row past cooldown with recent last_ok is responding.
+    Anonymous node IDs only — safe to display anywhere.
+    """
+    conn = db()
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cutoff = (now - datetime.timedelta(seconds=PULL_ONLINE_AFTER)).isoformat()
+        now_s = now.isoformat()
+        rows = conn.execute(
+            """SELECT name, pull, share, last_seen, last_ok, served, down_until
+               FROM hosters WHERE enabled=1
+               AND (last_seen>? OR last_ok>?)
+               AND (down_until='' OR down_until IS NULL OR down_until<=?)
+               ORDER BY pull DESC, last_seen DESC, last_ok DESC LIMIT ?""",
+            (cutoff, cutoff, now_s, max(1, min(limit, 25))),
+        ).fetchall()
+        return [{"name": r["name"], "pull": bool(r["pull"]), "share": r["share"] or 0,
+                 "last_seen": r["last_seen"] or "", "last_ok": r["last_ok"] or "",
+                 "served": r["served"] or 0}
                 for r in rows]
     finally:
         conn.close()
@@ -995,8 +1033,14 @@ async def ask_pull_pool(prompt: str, model: str, temperature: float, max_tokens:
     try:
         while time.time() < deadline:
             await asyncio.sleep(1.5)
-            row = conn.execute("SELECT status, result, error FROM pool_jobs WHERE id=?",
-                               (job_id,)).fetchone()
+            # Fresh short connection per poll — never hold one across sleeps
+            # (WAL or not, a 25s-held reader stalls writers).
+            c2 = db()
+            try:
+                row = c2.execute("SELECT status, result, error FROM pool_jobs WHERE id=?",
+                                 (job_id,)).fetchone()
+            finally:
+                c2.close()
             if row is None:
                 break
             if row["status"] == "done":
@@ -1407,64 +1451,79 @@ class BusyError(Exception):
 
 
 class FairAIQueue:
-    """Round-robin across guilds so one server can't hog the weak box.
-
-    A single worker runs model calls one at a time. Each guild gets at most
-    one slot per round; if a guild has too many waiting, it's told "busy".
+    """Per-guild workers with global fairness: each server gets its own
+    worker (one slow guild can't stall everyone), while a global semaphore
+    caps total concurrent model calls so a weak box isn't melted. Queues
+    still cap per-guild backlog with a busy reply.
     """
 
-    def __init__(self, max_waiting=2, busy_reply="Quaestio's head is busy — one chat at a time. Ask again in a moment."):
+    def __init__(self, max_waiting=2, max_concurrent=2,
+                 busy_reply="Quaestio's head is busy — one chat at a time. Ask again in a moment."):
         self._queues = {}
-        self._worker = None
+        self._workers = {}
+        self._slots = asyncio.Semaphore(max_concurrent) if hasattr(asyncio, "Semaphore") else None
         self._max_waiting = max_waiting
         self.busy_reply = busy_reply
 
     def submit(self, guild_id, factory):
         fut = asyncio.get_running_loop().create_future()
-        q = self._queues.setdefault(str(guild_id), [])
+        gid = str(guild_id)
+        q = self._queues.setdefault(gid, [])
         if len(q) >= self._max_waiting:
             fut.set_exception(BusyError(self.busy_reply))
             return fut
         q.append((fut, factory))
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._run())
+        w = self._workers.get(gid)
+        if w is None or w.done():
+            self._workers[gid] = asyncio.create_task(self._run_guild(gid))
         return fut
 
-    async def _run(self):
+    def drop(self, guild_id):
+        """Fail waiting (not running) jobs so a persona change applies instantly."""
+        q = self._queues.get(str(guild_id))
+        if not q:
+            return 0
+        n = 0
+        for fut, _factory in q:
+            if not fut.done():
+                fut.set_exception(BusyError("Settings updated — ask again with the new style! 🎨"))
+                n += 1
+        q.clear()
+        return n
+
+    async def _one(self, fut, factory):
+        # Worker budget slightly UNDER the waiter budget so the factory is
+        # cancelled first — no orphan run hogging a slot.
         try:
-            pending = True
-            while pending:
-                pending = False
-                for guild_id in list(self._queues):
-                    q = self._queues.get(guild_id)
-                    if not q:
-                        # prune empty guild queues so the dict doesn't grow unbounded
-                        self._queues.pop(guild_id, None)
-                        continue
-                    pending = True
-                    fut, factory = q.pop(0)
-                    if fut.cancelled():
-                        continue
-                    try:
-                        # Worker budget slightly UNDER the waiter budget so the
-                        # factory is cancelled first — no orphan run hogging
-                        # the single worker after the user was told "too long".
-                        result = await asyncio.wait_for(
-                            factory(), timeout=OLLAMA_TIMEOUT + 25
-                        )
-                        if not fut.done():
-                            fut.set_result(result)
-                    except asyncio.TimeoutError:
-                        if not fut.done():
-                            fut.set_exception(ConnectionError("AI took too long."))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        if not fut.done():
-                            fut.set_exception(exc)
-                await asyncio.sleep(0)
+            if self._slots is not None:
+                async with self._slots:
+                    result = await asyncio.wait_for(factory(), timeout=OLLAMA_TIMEOUT + 25)
+            else:
+                result = await asyncio.wait_for(factory(), timeout=OLLAMA_TIMEOUT + 25)
+            if not fut.done():
+                fut.set_result(result)
+        except asyncio.TimeoutError:
+            if not fut.done():
+                fut.set_exception(ConnectionError("AI took too long."))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+
+    async def _run_guild(self, guild_id):
+        try:
+            while True:
+                q = self._queues.get(guild_id)
+                if not q:
+                    self._queues.pop(guild_id, None)
+                    return
+                fut, factory = q.pop(0)
+                if fut.cancelled():
+                    continue
+                await self._one(fut, factory)
         finally:
-            self._worker = None
+            self._workers.pop(guild_id, None)
 
 
 ai_queue = FairAIQueue()
@@ -1596,19 +1655,33 @@ async def _wait_ai_answer(fut, budget: float, on_slow=None):
     silence call on_slow() once (e.g. 'still working…') instead of leaving
     only the typing indicator, then wait out the remaining budget."""
     first = min(45.0, budget)
-    done, _ = await asyncio.wait([fut], timeout=first)
-    if done:
-        return fut.result()
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout=first)
+    except asyncio.TimeoutError:
+        pass
     if on_slow is not None:
         try:
             await on_slow()
         except (discord.Forbidden, discord.HTTPException):
             pass
     rest = max(1.0, budget - first)
-    done2, _ = await asyncio.wait([fut], timeout=rest)
-    if done2:
-        return fut.result()
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), timeout=rest)
+    except asyncio.TimeoutError:
+        pass
     raise asyncio.TimeoutError()
+
+
+def _prune_notice_caches():
+    """Bound in-memory notice dicts (called per AI reply; cheap)."""
+    now = time.time()
+    try:
+        for key in [k for k, v in _ai_error_at.items() if now - v > 3600]:
+            _ai_error_at.pop(key, None)
+        for key in [k for k, v in _quota_notice_at.items() if now - v > 3600]:
+            _quota_notice_at.pop(key, None)
+    except Exception:
+        pass
 
 
 async def ai_reply(message: discord.Message, *, ping: bool = True):
@@ -1639,19 +1712,31 @@ async def ai_reply(message: discord.Message, *, ping: bool = True):
         raw = raw.replace(f"<@{me_id}>", "").replace(f"<@!{me_id}>", "")
     question = raw.strip() or "…"
     asker = message.author.display_name or "member"
+    _prune_notice_caches()
     context = memory.context(guild_id, message.channel.id, cfg["memory"])
     profiles = profile_lines(guild_id, [m.get("user_id") for m in context] + [message.author.id])
     persona_system, full_prompt = build_prompt(cfg["persona"], context, question, cfg["instructions"], profiles, asker_name=asker)
 
     async def factory():
-        return await ask_ollama_any(cfg, full_prompt, asker=asker, system=persona_system)
+        # Re-read config at execution time so persona changes apply instantly,
+        # even to jobs that were already queued.
+        cfg2 = guild_ai_config(guild_id)
+        persona_system2, full_prompt2 = build_prompt(
+            cfg2["persona"], context, question, cfg2["instructions"], profiles, asker_name=asker)
+        return await ask_ollama_any(cfg2, full_prompt2, asker=asker, system=persona_system2)
 
     fut = ai_queue.submit(guild_id, factory)
     budget = OLLAMA_TIMEOUT + 30
 
+    async def _slow():
+        try:
+            await message.channel.send("⏳ Still working on it — your reply is queued! 💭")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
     async with message.channel.typing():
         try:
-            answer = await _wait_ai_answer(fut, budget)
+            answer = await _wait_ai_answer(fut, budget, on_slow=_slow)
             await asyncio.sleep(0)
         except BusyError:
             return False
@@ -2563,7 +2648,7 @@ async def tictactoe(interaction: discord.Interaction, opponent: discord.Member):
         await interaction.response.send_message("You can't play against yourself. Pick a friend!", ephemeral=True)
         return
     key = (interaction.guild.id, interaction.channel.id)
-    if key in _games:
+    if key in _games or key in _hangman_games:
         await interaction.response.send_message(
             "A game is already running in this channel. Use `/move` to play.", ephemeral=True)
         return
@@ -2621,6 +2706,1194 @@ async def move(interaction: discord.Interaction, cell: int):
         f"{_board_view(game['board'])}\n"
         f"<@{next_player}> to move ({next_mark}) — `/move 1-9`."
     )
+
+
+# ---------------------------------------------------------------------------
+# Hangman — solo vs bot, together (co-op), race (head-to-head), custom word
+# /hangman [opponent] [mode] + A–Z menu + /hm_guess + ✏️ Set-word modal
+# ---------------------------------------------------------------------------
+
+_HM_MAX_WRONG = 6
+_hangman_games = {}
+
+_HM_STAGES = [
+    "```\n  +---+\n  |   |\n      |\n      |\n      |\n      |\n=========\n```",
+    "```\n  +---+\n  |   |\n  O   |\n      |\n      |\n      |\n=========\n```",
+    "```\n  +---+\n  |   |\n  O   |\n  |   |\n      |\n      |\n=========\n```",
+    "```\n  +---+\n  |   |\n  O   |\n /|   |\n      |\n      |\n=========\n```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\  |\n      |\n      |\n=========\n```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\  |\n /    |\n      |\n=========\n```",
+    "```\n  +---+\n  |   |\n  O   |\n /|\\  |\n / \\  |\n      |\n=========\n```",
+]
+
+_HM_WORDS = [
+    ("APPLE", "a red or green fruit"), ("BANANA", "long yellow fruit"),
+    ("ORANGE", "citrus fruit + colour"), ("GRAPE", "tiny vine fruit"),
+    ("MANGO", "tropical stone fruit"), ("PIZZA", "cheesy Italian dish"),
+    ("BREAD", "baked loaf"), ("HONEY", "made by bees"),
+    ("TIGER", "striped big cat"), ("PANDA", "bamboo-eating bear"),
+    ("KOALA", "Australian tree marsupial"), ("DOLPHIN", "smart sea mammal"),
+    ("PENGUIN", "flightless Antarctic bird"), ("GIRAFFE", "tallest animal"),
+    ("ZEBRA", "striped horse-like animal"), ("KANGAROO", "hopping marsupial"),
+    ("CASTLE", "medieval fortress"), ("BRIDGE", "spans a river"),
+    ("ROCKET", "flies to space"), ("PLANET", "Earth is one"),
+    ("OCEAN", "vast salty water"), ("DESERT", "sandy dry place"),
+    ("VOLCANO", "erupting mountain"), ("GUITAR", "six-string instrument"),
+    ("PIANO", "keys instrument"), ("DRUM", "you hit it for rhythm"),
+    ("SOCCER", "world's most played sport"), ("TENNIS", "racket + net sport"),
+    ("WIZARD", "spell caster"), ("DRAGON", "fire-breathing beast"),
+    ("PIRATE", "sails with a treasure map"), ("ROBOT", "metal machine helper"),
+    ("COMPUTER", "runs Discord bots"), ("KEYBOARD", "typing tool"),
+    ("PYTHON", "programming language + snake"), ("DISCORD", "where you play this"),
+    ("CANDLE", "wax + flame"), ("LANTERN", "portable light"),
+    ("BOOK", "pages of story"), ("PENCIL", "write + erase tool"),
+    ("GARDEN", "flowers grow here"), ("FOREST", "dense trees"),
+    ("MOUNTAIN", "tall peak"), ("RIVER", "flowing water"),
+    ("CLOUD", "floats in the sky"), ("RAINBOW", "colour arc after rain"),
+    ("SNOWMAN", "built from snowballs"), ("BEACH", "sand + waves"),
+    ("ISLAND", "land in the sea"), ("TREASURE", "buried chest of gold"),
+    ("FRIEND", "what co-op games need"),
+]
+
+
+def _hm_key(interaction: discord.Interaction):
+    g = interaction.guild.id if interaction.guild else "dm"
+    return (g, interaction.channel.id)
+
+
+def _hm_new_board() -> dict:
+    return {"guessed": set(), "wrong": [], "lives": _HM_MAX_WRONG, "scores": {}}
+
+
+def _hm_masked(word: str, guessed: set) -> str:
+    return "  ".join(c if c in guessed else "▁" for c in word)
+
+
+def _hm_hearts(lives: int) -> str:
+    return "❤️" * lives + "🖤" * (_HM_MAX_WRONG - lives)
+
+
+def _hm_board_block(word: str, board: dict) -> str:
+    wrong_n = len(board["wrong"])
+    return (
+        f"{_HM_STAGES[wrong_n]}\n"
+        f"**Word:** `{_hm_masked(word, board['guessed'])}`\n\n"
+        f"**Wrong ({wrong_n}/{_HM_MAX_WRONG}):** "
+        f"{', '.join(f'`{c}`' for c in board['wrong']) if board['wrong'] else '—'}\n"
+        f"**Lives:** {_hm_hearts(board['lives'])} `{board['lives']} left`\n"
+    )
+
+
+def _hm_solved(word: str, board: dict) -> bool:
+    return "▁" not in _hm_masked(word, board["guessed"]).replace(" ", "")
+
+
+def _hm_my_boards(game: dict, user_id: int) -> list:
+    """Board keys this user may guess on. Race = own board only."""
+    if game["mode"] == "race":
+        k = str(user_id)
+        return [k] if k in game["boards"] else []
+    return ["shared"]
+
+
+def _hm_embed(game: dict, *, over=None, winner_id=None) -> discord.Embed:
+    mode = game["mode"]
+    if mode == "race":
+        parts = []
+        for uid in (str(game["host_id"]), str(game.get("opponent_id") or "")):
+            b = game["boards"].get(uid)
+            if not b:
+                continue
+            parts.append(f"**<@{uid}>**\n" + _hm_board_block(game["word"], b))
+        desc = "\n".join(parts)
+    else:
+        desc = _hm_board_block(game["word"], game["boards"]["shared"])
+    if over is None:
+        titles = {
+            "solo": "🎯 Hangman — guess a letter!",
+            "together": "🤝 Hangman together — guess a letter!",
+            "race": "🏁 Hangman race — fastest solver wins!",
+        }
+        color = 0x5865F2
+        title = titles.get(mode, "🎯 Hangman — guess a letter!")
+        embed = discord.Embed(title=title, description=desc, color=color)
+        if mode == "race":
+            top = []
+            for uid, b in game["boards"].items():
+                n = sum(b["scores"].values())
+                if n:
+                    top.append((uid, n))
+            top.sort(key=lambda kv: -kv[1])
+            if top:
+                embed.add_field(name="⚡ Score", value=" · ".join(f"<@{u}> ({n}✅)" for u, n in top[:4]), inline=False)
+        else:
+            b = game["boards"]["shared"]
+            top = sorted(b["scores"].items(), key=lambda kv: -kv[1])[:3]
+            if top:
+                embed.add_field(name="Top guessers", value=", ".join(f"<@{u}> ({n}✅)" for u, n in top), inline=False)
+        clue = game["hint"] if game.get("hint_revealed") else "Use 💡 Hint to reveal the clue!"
+        embed.add_field(name="💡 Clue", value=clue, inline=False)
+        if mode == "race":
+            players = f"<@{game['host_id']}> 🏁 vs <@{game.get('opponent_id')}> — guess on YOUR board (menu or `/hm_guess`)"
+        elif mode == "together":
+            players = f"<@{game['host_id']}> + everyone — shared board, shared lives!"
+        else:
+            players = f"<@{game['host_id']}> (solo vs Quaestio 🤖 + spectators welcome)"
+        embed.add_field(name="Players", value=players, inline=False)
+        embed.set_footer(text="Game ends in 5 min idle · host can ✏️ set a custom word")
+    elif over == "win":
+        who = f"<@{winner_id}>" if winner_id else "You"
+        embed = discord.Embed(title=f"🎉 {who} cracked it!" if winner_id else "🎉 You cracked it!",
+                              description=desc + f"\n**Word was `{game['word']}`**", color=0x57F287)
+    else:
+        embed = discord.Embed(title="💀 Game over!", description=desc + f"\n**Word was `{game['word']}`** — better luck next time!", color=0xED4245)
+    return embed
+
+
+class HangmanLetterSelect(discord.ui.Select):
+    def __init__(self, game: dict, user_id: int = 0):
+        if game["mode"] == "race" and user_id:
+            b = game["boards"].get(str(user_id), _hm_new_board())
+            guessed = b["guessed"]
+        else:
+            guessed = game["boards"]["shared"]["guessed"] if "shared" in game["boards"] else set()
+        remaining = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if c not in guessed]
+        opts = [discord.SelectOption(label=c, value=c) for c in remaining[:25]]
+        super().__init__(placeholder="Pick a letter…" if opts else "No letters left",
+                         min_values=1, max_values=1,
+                         options=opts or [discord.SelectOption(label="—", value="—")],
+                         disabled=not opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        await _hm_apply_guess(interaction, self.values[0], via_view=True)
+
+
+class HangmanWordModal(discord.ui.Modal, title="Set a custom word"):
+    word = discord.ui.TextInput(label="Secret word (letters only, 3–12)",
+                                placeholder="e.g. PINEAPPLE", min_length=3, max_length=12)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cmd_tick("hm_word")
+        key = _hm_key(interaction)
+        game = _hangman_games.get(key)
+        if not game or interaction.user.id != game["host_id"]:
+            await interaction.response.send_message("Only the host can set the word.", ephemeral=True)
+            return
+        w = (self.word.value or "").strip().upper()
+        if not w.isalpha():
+            await interaction.response.send_message("Letters A–Z only, please!", ephemeral=True)
+            return
+        game["word"] = w
+        game["hint"] = "a custom word from the host 😏"
+        game["hint_revealed"] = True
+        for b in game["boards"].values():
+            b["guessed"] = set()
+            b["wrong"] = []
+            b["lives"] = _HM_MAX_WRONG
+            b["scores"] = {}
+        view = game.get("view")
+        embed = _hm_embed(game)
+        if view:
+            view.refresh_select(game, interaction.user.id)
+            await interaction.response.edit_message(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed)
+
+
+class HangmanView(discord.ui.View):
+    def __init__(self, key, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.key = key
+        self.message = None
+
+    def refresh_select(self, game: dict, user_id: int = 0):
+        for child in list(self.children):
+            if isinstance(child, HangmanLetterSelect):
+                self.remove_item(child)
+        self.add_item(HangmanLetterSelect(game, user_id))
+
+    @discord.ui.button(label="Hint", emoji="💡", style=discord.ButtonStyle.secondary)
+    async def hint(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cmd_tick("hm_hint")
+        game = _hangman_games.get(self.key)
+        if not game:
+            await interaction.response.send_message("No hangman game here. Start one with `/hangman`.", ephemeral=True)
+            return
+        if game.get("hint_used"):
+            await interaction.response.send_message("Hint already used!", ephemeral=True)
+            return
+        keys = _hm_my_boards(game, interaction.user.id)
+        if not keys:
+            await interaction.response.send_message("Spectators can't use hints in a race!", ephemeral=True)
+            return
+        b = game["boards"][keys[0]]
+        hidden = [c for c in game["word"] if c not in b["guessed"]]
+        if not hidden:
+            await interaction.response.send_message("Nothing left to reveal!", ephemeral=True)
+            return
+        game["hint_used"] = True
+        game["hint_revealed"] = True
+        b["guessed"].add(random.choice(hidden))
+        await _hm_after_move(interaction, game, keys[0], via_view=True)
+
+    @discord.ui.button(label="Set word", emoji="✏️", style=discord.ButtonStyle.secondary)
+    async def setword(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = _hangman_games.get(self.key)
+        if not game or interaction.user.id != game["host_id"]:
+            await interaction.response.send_message("Only the host can set the word.", ephemeral=True)
+            return
+        await interaction.response.send_modal(HangmanWordModal())
+
+    @discord.ui.button(label="End", emoji="🛑", style=discord.ButtonStyle.danger)
+    async def end_game(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cmd_tick("hm_stop")
+        game = _hangman_games.get(self.key)
+        if not game:
+            await interaction.response.send_message("No game running.", ephemeral=True)
+            return
+        if interaction.user.id not in (game["host_id"], game.get("opponent_id") or 0) and not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message("Only the host/opponent (or a mod) can end it.", ephemeral=True)
+            return
+        _hangman_games.pop(self.key, None)
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(embed=_hm_embed(game, over="lose"), view=self)
+        super().stop()
+
+    async def on_timeout(self):
+        game = _hangman_games.pop(self.key, None)
+        for child in self.children:
+            child.disabled = True
+        if self.message and game:
+            try:
+                await self.message.edit(content="⏰ Hangman timed out (5 min idle).", embed=_hm_embed(game, over="lose"), view=self)
+            except discord.HTTPException:
+                pass
+
+
+def _hm_finish_board(game: dict, bkey: str, user_id: int):
+    """Check one board: returns ('win', uid) / ('dead', None) / (None, None)."""
+    b = game["boards"][bkey]
+    if _hm_solved(game["word"], b):
+        return "win", user_id if game["mode"] == "race" else None
+    if b["lives"] <= 0:
+        return "dead", None
+    return None, None
+
+
+async def _hm_after_move(interaction: discord.Interaction, game: dict, bkey: str, *, via_view: bool):
+    """Shared win/lose/continue renderer for View + /hm_guess."""
+    key = _hm_key(interaction)
+    view = game.get("view")
+    b = game["boards"][bkey]
+    uid = interaction.user.id
+
+    async def _send(embed, v):
+        if via_view:
+            await interaction.response.edit_message(embed=embed, view=v)
+        else:
+            await interaction.response.send_message(embed=embed)
+            try:
+                if v and v.message:
+                    await v.message.edit(embed=embed, view=v)
+            except discord.HTTPException:
+                pass
+
+    def _lock(v):
+        if v:
+            for child in v.children:
+                child.disabled = True
+            v.stop()
+
+    if _hm_solved(game["word"], b):
+        _hangman_games.pop(key, None)
+        _lock(view)
+        await _send(_hm_embed(game, over="win", winner_id=uid if game["mode"] == "race" else None), view)
+        return
+    if b["lives"] <= 0:
+        if game["mode"] == "race":
+            alive = [k for k, bb in game["boards"].items()
+                     if not _hm_solved(game["word"], bb) and bb["lives"] > 0]
+            if not alive:
+                _hangman_games.pop(key, None)
+                _lock(view)
+                await _send(_hm_embed(game, over="lose"), view)
+                return
+            # This racer is out — the other board plays on.
+            embed = _hm_embed(game)
+            embed.add_field(name="💀 Eliminated", value=f"<@{uid}> is out of lives!", inline=False)
+            if view:
+                view.refresh_select(game, uid)
+            if via_view:
+                await interaction.response.edit_message(embed=embed, view=view)
+            else:
+                await interaction.response.send_message(embed=embed)
+            return
+        _hangman_games.pop(key, None)
+        _lock(view)
+        await _send(_hm_embed(game, over="lose"), view)
+        return
+    embed = _hm_embed(game)
+    if view:
+        view.refresh_select(game, uid)
+        if via_view:
+            await interaction.response.edit_message(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed)
+            try:
+                if view.message:
+                    await view.message.edit(embed=embed, view=view)
+            except discord.HTTPException:
+                pass
+    else:
+        await interaction.response.send_message(embed=embed)
+
+
+async def _hm_apply_guess(interaction: discord.Interaction, raw: str, *, via_view: bool):
+    cmd_tick("hm_guess")
+    key = _hm_key(interaction)
+    game = _hangman_games.get(key)
+    if not game:
+        if via_view:
+            await interaction.response.edit_message(content="Game already ended.", view=None)
+        else:
+            await interaction.response.send_message("No hangman game in this channel. Start one with `/hangman`.", ephemeral=True)
+        return
+    letter = (raw or "").strip().upper()
+    if len(letter) != 1 or not letter.isalpha():
+        await interaction.response.send_message("Guess one letter A–Z.", ephemeral=True)
+        return
+    keys = _hm_my_boards(game, interaction.user.id)
+    if not keys:
+        await interaction.response.send_message("Racers only — you're spectating this race! 👀", ephemeral=True)
+        return
+    bkey = keys[0]
+    b = game["boards"][bkey]
+    if _hm_solved(game["word"], b) or b["lives"] <= 0:
+        await interaction.response.send_message("Your board is already finished!", ephemeral=True)
+        return
+    if letter in b["guessed"]:
+        await interaction.response.send_message(f"`{letter}` was already tried — pick another!", ephemeral=True)
+        return
+    b["guessed"].add(letter)
+    if letter in game["word"]:
+        b["scores"][interaction.user.id] = b["scores"].get(interaction.user.id, 0) + game["word"].count(letter)
+    else:
+        b["wrong"].append(letter)
+        b["lives"] -= 1
+    await _hm_after_move(interaction, game, bkey, via_view=via_view)
+
+
+@bot.tree.command(name="hangman", description="Hangman: solo, together, race, or custom word.")
+@app_commands.describe(opponent="Friend to race / play with (race needs one)",
+                       mode="How to play: solo, together (co-op), or race (head-to-head)")
+@app_commands.choices(mode=[app_commands.Choice(name="🧍 Solo vs Quaestio", value="solo"),
+                            app_commands.Choice(name="🤝 Together (co-op)", value="together"),
+                            app_commands.Choice(name="🏁 Race (head-to-head)", value="race")])
+async def hangman(interaction: discord.Interaction, opponent: discord.Member | None = None,
+                  mode: str = "solo"):
+    cmd_tick("hangman")
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/hangman` inside a server.", ephemeral=True)
+        return
+    if mode == "race" and (not opponent or opponent.bot or opponent == interaction.user):
+        await interaction.response.send_message("Race mode needs a real friend — tag an opponent!", ephemeral=True)
+        return
+    if opponent and (opponent.bot or opponent == interaction.user):
+        await interaction.response.send_message("Tag a real friend (not yourself or a bot) — or leave it empty for solo.", ephemeral=True)
+        return
+    key = _hm_key(interaction)
+    if key in _hangman_games or key in _games:
+        await interaction.response.send_message("A game is already running in this channel. Finish it first!", ephemeral=True)
+        return
+    word, hint = random.choice(_HM_WORDS)
+    view = HangmanView(key, timeout=300)
+    if mode == "race":
+        boards = {str(interaction.user.id): _hm_new_board(), str(opponent.id): _hm_new_board()}
+        title = f"🏁 **Hangman race:** {interaction.user.mention} vs {opponent.mention} — fastest solver wins!"
+    elif mode == "together":
+        boards = {"shared": _hm_new_board()}
+        title = f"🤝 **Hangman together:** {interaction.user.mention} + everyone — shared board, shared lives!"
+    else:
+        mode = "solo"
+        boards = {"shared": _hm_new_board()}
+        title = (f"🎯 **Hangman:** {interaction.user.mention} vs {opponent.mention}"
+                 if opponent else f"🎯 **Hangman:** {interaction.user.mention} vs Quaestio 🤖")
+    game = {
+        "mode": mode, "word": word, "hint": hint, "hint_revealed": False, "hint_used": False,
+        "host_id": interaction.user.id,
+        "opponent_id": opponent.id if opponent else None,
+        "boards": boards, "view": view,
+    }
+    _hangman_games[key] = game
+    view.refresh_select(game, interaction.user.id)
+    await interaction.response.send_message(title, embed=_hm_embed(game), view=view)
+    view.message = await interaction.original_response()
+
+
+@bot.tree.command(name="hm_guess", description="Guess a letter in the running hangman game.")
+@app_commands.describe(letter="One letter A–Z")
+async def hm_guess(interaction: discord.Interaction, letter: str):
+    await _hm_apply_guess(interaction, letter, via_view=False)
+
+
+
+# ---------------------------------------------------------------------------
+# Would-You-Rather — open vote, 60s, early majority close
+# ---------------------------------------------------------------------------
+_WYR_QUESTIONS = [
+    ("🛸 Live on Mars", "🌊 Live under the ocean"),
+    ("🧠 Read minds", "👻 Be invisible"),
+    ("🐉 Own a dragon", "🦄 Own a unicorn"),
+    ("🍕 Eat only pizza forever", "🍔 Eat only burgers forever"),
+    ("✈️ Teleport anywhere", "⏳ Time-travel once"),
+    ("🎤 Be famous singer", "🎬 Be famous actor"),
+    ("❄️ Always be cold", "🔥 Always be hot"),
+    ("🐱 Talk to cats", "🐶 Talk to dogs"),
+    ("🌙 Never sleep", "🍩 Never eat"),
+    ("🏝️ Desert island $1M", "🏙️ City life $100k"),
+    ("🧙 Have magic powers", "🤖 Have robot army"),
+    ("📚 Know every book", "🗣️ Speak every language"),
+    ("🦸 Super strength", "⚡ Super speed"),
+    ("🎮 Pro gamer", "🏆 Pro athlete"),
+    ("👽 Meet aliens", "🦕 Meet dinosaurs"),
+    ("🍫 Chocolate rain", "🧀 Cheese snow"),
+    ("🚀 Go to space", "🤿 Explore deep sea"),
+    ("🎨 Be art genius", "🎵 Be music genius"),
+    ("🐼 Panda sidekick", "🦊 Fox sidekick"),
+    ("💸 Win lottery, no friends know", "📣 Win half, everyone celebrates"),
+]
+
+_WYR_AI_THEMES = ["sci-fi", "fantasy", "food", "travel", "superpowers", "animals", "school", "gaming"]
+
+_wyr_games = {}
+_wyr_last = {}
+
+WYR_DURATION = 60
+WYR_COOLDOWN = 10
+WYR_EARLY_WIN = 6
+
+
+def _wyr_bar(pct: int, width: int = 12) -> str:
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _wyr_embed(state) -> discord.Embed:
+    a, b = state["a"], state["b"]
+    va, vb = len(state["votes_a"]), len(state["votes_b"])
+    total = va + vb
+    pa = round(va / total * 100) if total else 50
+    pb = 100 - pa if total else 50
+    lead = "⚖️ Tied!" if va == vb else (f"🔵 A leads!" if va > vb else "🔴 B leads!")
+    desc = (
+        f"🔵 **A:** {a}\n`{_wyr_bar(pa)}` **{pa}%** ({va})\n\n"
+        f"🔴 **B:** {b}\n`{_wyr_bar(pb)}` **{pb}%** ({vb})\n\n"
+        f"{lead}\n👥 **{total} vote(s)** — tap a button! Change vote anytime."
+    )
+    if state.get("opponent_id"):
+        desc += f"\n⚔️ Duel: <@{state['host_id']}> vs <@{state['opponent_id']}> — everyone votes!"
+    embed = discord.Embed(title="🤔 Would You Rather…?", description=desc, color=0xA78BFA)
+    embed.set_footer(text=f"Ends in {max(0, int(state['ends_at'] - time.time()))}s · first to {WYR_EARLY_WIN} wins early")
+    return embed
+
+
+class WYRButton(discord.ui.Button):
+    def __init__(self, side: str):
+        self.side = side
+        emoji = "🔵" if side == "a" else "🔴"
+        label = "A" if side == "a" else "B"
+        super().__init__(style=discord.ButtonStyle.primary if side == "a" else discord.ButtonStyle.danger,
+                         label=label, emoji=emoji)
+
+    async def callback(self, interaction: discord.Interaction):
+        cmd_tick("wyr_vote")
+        view: WYRView = self.view
+        state = view.state
+        uid = interaction.user.id
+        state["votes_a"].discard(uid)
+        state["votes_b"].discard(uid)
+        (state["votes_a"] if self.side == "a" else state["votes_b"]).add(uid)
+        if len(state["votes_a"]) >= WYR_EARLY_WIN or len(state["votes_b"]) >= WYR_EARLY_WIN:
+            await view.finish(interaction, reason="majority")
+            return
+        await view.render(interaction)
+
+
+class WYRView(discord.ui.View):
+    def __init__(self, state, timeout: int = WYR_DURATION):
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.message = None
+        self.add_item(WYRButton("a"))
+        self.add_item(WYRButton("b"))
+
+    async def render(self, interaction: discord.Interaction):
+        embed = _wyr_embed(self.state)
+        if self.message:
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.send_message(embed=embed, view=self)
+            self.message = await interaction.original_response()
+
+    async def finish(self, interaction_or_none, reason="time"):
+        key = self.state["key"]
+        _wyr_games.pop(key, None)
+        for c in self.children:
+            c.disabled = True
+        va, vb = len(self.state["votes_a"]), len(self.state["votes_b"])
+        winner = "🤝 Tie!" if va == vb else ("🔵 **A wins!** 🎉" if va > vb else "🔴 **B wins!** 🎉")
+        embed = _wyr_embed(self.state)
+        embed.add_field(name="🏁 Final", value=f"{winner}\nA: {va} · B: {vb}", inline=False)
+        embed.set_footer(text=f"Closed ({reason}) · thanks for voting!")
+        embed.color = 0x22C55E if va != vb else 0xA78BFA
+        try:
+            if interaction_or_none is not None and hasattr(interaction_or_none, "response"):
+                try:
+                    await interaction_or_none.response.edit_message(embed=embed, view=self)
+                except discord.InteractionResponded:
+                    await self.message.edit(embed=embed, view=self)
+            elif self.message:
+                await self.message.edit(embed=embed, view=self)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+        self.stop()
+
+    async def on_timeout(self):
+        await self.finish(None, reason="60s up")
+
+
+async def _wyr_ai_pair(guild_id) -> tuple | None:
+    """Optional AI-generated pair. Returns None on any failure -> fallback."""
+    try:
+        cfg = guild_ai_config(guild_id) if guild_id else None
+        if not cfg:
+            return None
+        theme = random.choice(_WYR_AI_THEMES)
+        prompt = (f"Write one family-friendly would-you-rather question, theme {theme}. "
+                  "Reply with exactly two short options separated by ' | ', each under 8 words, PG, no explanation.")
+        raw = await asyncio.wait_for(
+            ask_ollama_any(cfg, prompt, temperature=0.8, max_tokens=60,
+                           asker="wyr", system="You write short PG party-game prompts. No NSFW, no politics."),
+            timeout=25)
+        parts = [p.strip(" .\"'") for p in raw.replace("\n", " ").split("|")]
+        if len(parts) >= 2 and all(2 <= len(p) <= 80 for p in parts[:2]):
+            return parts[0][:80], parts[1][:80]
+    except Exception:
+        pass
+    return None
+
+
+@bot.tree.command(name="wouldyou", description="Would-You-Rather vote: A vs B with live bars.")
+@app_commands.describe(opponent="Optional rival for a duel (everyone still votes)",
+                       use_ai="Let AI invent the question (falls back to built-ins)")
+async def wouldyou(interaction: discord.Interaction, opponent: discord.Member | None = None,
+                   use_ai: bool = False):
+    cmd_tick("wouldyou")
+    now = time.time()
+    if now - _wyr_last.get(interaction.user.id, 0) < WYR_COOLDOWN:
+        await interaction.response.send_message(f"⏳ Slow down — try again in {WYR_COOLDOWN}s.", ephemeral=True)
+        return
+    _wyr_last[interaction.user.id] = now
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/wouldyou` inside a server.", ephemeral=True)
+        return
+    key = (interaction.guild.id, interaction.channel.id)
+    if key in _wyr_games:
+        await interaction.response.send_message("⚔️ A Would-You-Rather is already running here — vote on it!", ephemeral=True)
+        return
+    if opponent and (opponent.bot or opponent == interaction.user):
+        await interaction.response.send_message("Pick another human as rival (or leave empty for open vote).", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=False)
+    a, b = random.choice(_WYR_QUESTIONS)
+    if use_ai:
+        pair = await _wyr_ai_pair(interaction.guild.id)
+        if pair:
+            a, b = pair
+
+    state = {"key": key, "a": a, "b": b, "votes_a": set(), "votes_b": set(),
+             "host_id": interaction.user.id,
+             "opponent_id": opponent.id if opponent else None,
+             "ends_at": time.time() + WYR_DURATION}
+    _wyr_games[key] = state
+    view = WYRView(state)
+    embed = _wyr_embed(state)
+    msg = await interaction.followup.send(embed=embed, view=view)
+    view.message = msg
+
+
+# ---------------------------------------------------------------------------
+# Truth or Dare — rotation, AI w/ fallback lists, pass/skip
+# ---------------------------------------------------------------------------
+_TOD_TRUTHS = [
+    "What's the funniest text you've ever sent by accident?",
+    "What's a talent you wish you had?",
+    "What's your most-used emoji and why?",
+    "What's the weirdest food combo you love?",
+    "What's a movie you can quote from memory?",
+    "What's your earliest childhood memory?",
+    "What's the best gift you've ever received?",
+    "What's a skill you learned from YouTube?",
+    "What's your dream vacation?",
+    "What's the silliest fear you had as a kid?",
+    "What's your favorite family tradition?",
+    "What's a song you sing in the shower?",
+    "What's the nicest thing a friend did for you?",
+    "What's your favorite game right now?",
+    "What would you do with $1,000 today?",
+    "What's the best advice you've ever gotten?",
+    "What's a hobby you want to try?",
+    "What's your favorite breakfast food?",
+    "What's the coolest place you've visited?",
+    "What's something you're proud of this year?",
+    "What's your go-to comfort snack?",
+    "What's a book or show you recommend to everyone?",
+    "What's the funniest nickname you've had?",
+    "What's your dream pet?",
+    "What's one thing on your bucket list?",
+    "What's your favorite season and why?",
+    "What's the bravest thing you've done?",
+    "What's a small thing that always makes you smile?",
+    "What's your hidden talent?",
+    "What's the kindest thing you've done this month?",
+]
+_TOD_DARES = [
+    "Send a compliment to the last person who messaged here.",
+    "Do 10 jumping jacks and report back.",
+    "Type with your elbows for your next 3 messages.",
+    "Draw a cat with your eyes closed and describe it.",
+    "Speak in pirate voice for your next 3 messages. 🏴‍☠️",
+    "Rank the 3 people above you from funniest to most serious.",
+    "Tell a 2-sentence spooky story. 👻",
+    "Do your best robot dance — describe it in 3 emojis.",
+    "Say the alphabet backwards as far as you can.",
+    "Give the bot a new nickname for today.",
+    "Post your best knock-knock joke.",
+    "Invent a superhero name for the player above you.",
+    "Talk in ALL CAPS for your next 2 messages.",
+    "Describe your day as a movie trailer. 🎬",
+    "Send a voice-note-style message using only emojis (5+).",
+    "Compliment everyone's avatar in one message each.",
+    "Do 5 push-ups (or 5 silly stretches) and confirm.",
+    "Write a haiku about pizza. 🍕",
+    "Pretend you're a sports commentator for 2 messages.",
+    "Name 5 countries in 10 seconds — go!",
+    "Do your best villain laugh in text. 😈",
+    "Invent a handshake for you + the host (describe it).",
+    "Say something nice about each voter so far.",
+    "Draw ASCII art of your mood right now.",
+    "Tell us your best dad joke.",
+    "Act out (in text) opening a treasure chest. What's inside?",
+    "Give a 10-second pep talk to the whole channel. 📣",
+    "Swap your nickname to something silly for 10 min (if allowed).",
+    "Teach the chat one word in another language.",
+    "Predict the next Would-You-Rather winner. 🔮",
+]
+
+_tod_games = {}
+_tod_last = {}
+
+TOD_COOLDOWN = 8
+TOD_PASS_LIMIT = 2
+
+
+def _tod_embed(player_mention: str, kind: str, text: str, round_n: int, passes_left: int) -> discord.Embed:
+    color = 0x38BDF8 if kind == "truth" else 0xF472B6
+    emoji = "💭" if kind == "truth" else "🔥"
+    title = f"{emoji} {kind.upper()} for {player_mention}"
+    embed = discord.Embed(title=title, description=f"**{text}**", color=color)
+    embed.add_field(name="Round", value=f"#{round_n}", inline=True)
+    embed.add_field(name="Passes left", value=f"{passes_left} ⏭️", inline=True)
+    embed.set_footer(text="Truth = answer honestly · Dare = do it or pass · Buttons below!")
+    return embed
+
+
+async def _tod_ai_prompt(guild_id, kind: str):
+    try:
+        cfg = guild_ai_config(guild_id)
+        if not cfg:
+            return None
+        prompt = (f"Write one short family-friendly {kind} prompt for a Discord party game. "
+                  "PG-13 max, no romance/risqué, no personal data, no dangerous stunts, under 20 words. Prompt only.")
+        raw = await asyncio.wait_for(
+            ask_ollama_any(cfg, prompt, temperature=0.8, max_tokens=60,
+                           asker="tod", system="You write safe PG party prompts. Never NSFW, never mean, never unsafe."),
+            timeout=25)
+        clean = raw.strip().strip("\"'").split("\n")[0][:200]
+        banned = ("sex", "kiss", "drink", "alcohol", "naked", "suicide", "self-harm")
+        if len(clean) < 8 or any(w in clean.lower() for w in banned):
+            return None
+        return clean
+    except Exception:
+        return None
+
+
+async def _tod_pick(guild_id, kind: str, use_ai: bool):
+    if kind == "random":
+        kind = random.choice(["truth", "dare"])
+    if use_ai:
+        ai = await _tod_ai_prompt(guild_id, kind)
+        if ai:
+            return kind, ai
+    pool = _TOD_TRUTHS if kind == "truth" else _TOD_DARES
+    return kind, random.choice(pool)
+
+
+class TODView(discord.ui.View):
+    def __init__(self, key, timeout: int = 120):
+        super().__init__(timeout=timeout)
+        self.key = key
+        self.message = None
+
+    def _game(self):
+        return _tod_games.get(self.key)
+
+    async def _deal(self, interaction: discord.Interaction, kind: str):
+        game = self._game()
+        if not game:
+            await interaction.response.send_message("No ToD game here — start with `/tod`.", ephemeral=True)
+            return
+        if interaction.user.id not in (game["queue"][game["idx"]], game["host_id"]):
+            await interaction.response.send_message("It's not your turn — wait for your round! 👀", ephemeral=True)
+            return
+        # Defer FIRST: AI prompt generation can take 25s, interactions die in 3s.
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            deferred = True
+        except (discord.NotFound, discord.HTTPException):
+            deferred = False
+        use_ai = game.get("use_ai", True)
+        real_kind, text = await _tod_pick(interaction.guild.id if interaction.guild else None, kind, use_ai)
+        pid = game["queue"][game["idx"]]
+        game["current"] = {"type": real_kind, "text": text, "player": pid}
+        game["round"] += 1
+        embed = _tod_embed(f"<@{pid}>", real_kind, text, game["round"], TOD_PASS_LIMIT - game.get("passes_used", 0))
+        try:
+            if deferred:
+                await interaction.edit_original_response(embed=embed, view=self)
+            else:
+                await interaction.response.edit_message(embed=embed, view=self)
+        except (discord.NotFound, discord.HTTPException):
+            try:
+                if self.message:
+                    await self.message.edit(embed=embed, view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        if self.message is None:
+            try:
+                self.message = await interaction.original_response()
+            except discord.HTTPException:
+                pass
+
+    async def _advance(self, interaction: discord.Interaction):
+        game = self._game()
+        if not game:
+            return
+        game["idx"] = (game["idx"] + 1) % len(game["queue"])
+        game["passes_used"] = 0
+        nxt = game["queue"][game["idx"]]
+        embed = discord.Embed(title="🎲 Truth or Dare",
+                              description=f"<@{nxt}>'s turn! Pick **Truth**, **Dare**, or **Random** below. 👇",
+                              color=0xA78BFA)
+        embed.set_footer(text=f"Players: {len(game['queue'])} · Round #{game['round'] + 1}")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Truth", emoji="💭", style=discord.ButtonStyle.primary)
+    async def truth(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cmd_tick("tod_truth")
+        await self._deal(interaction, "truth")
+
+    @discord.ui.button(label="Dare", emoji="🔥", style=discord.ButtonStyle.danger)
+    async def dare(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cmd_tick("tod_dare")
+        await self._deal(interaction, "dare")
+
+    @discord.ui.button(label="Random", emoji="🎲", style=discord.ButtonStyle.secondary)
+    async def random_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cmd_tick("tod_random")
+        await self._deal(interaction, "random")
+
+    @discord.ui.button(label="Pass", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def pass_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = self._game()
+        if not game or not game.get("current"):
+            await interaction.response.send_message("Nothing to pass yet — draw first!", ephemeral=True)
+            return
+        if interaction.user.id != game["current"]["player"] and interaction.user.id != game["host_id"]:
+            await interaction.response.send_message("Only the current player can pass.", ephemeral=True)
+            return
+        game["passes_used"] = game.get("passes_used", 0) + 1
+        if game["passes_used"] > TOD_PASS_LIMIT:
+            await interaction.response.send_message("❌ No passes left — do it or Skip to next player!", ephemeral=True)
+            return
+        await self._deal(interaction, game["current"]["type"])
+
+    @discord.ui.button(label="Next player", emoji="⏩", style=discord.ButtonStyle.success)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cmd_tick("tod_next")
+        await self._advance(interaction)
+
+    async def on_timeout(self):
+        for c in self.children:
+            c.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        _tod_games.pop(self.key, None)
+
+
+async def _tod_start(interaction: discord.Interaction, player: discord.Member | None = None,
+                     choice: str = "none", use_ai: bool = True):
+    """Shared implementation for /truthordare + /tod (NOT a command itself)."""
+    cmd_tick("truthordare")
+    now = time.time()
+    if now - _tod_last.get(interaction.user.id, 0) < TOD_COOLDOWN:
+        await interaction.response.send_message("⏳ Slow down — ToD has a short cooldown.", ephemeral=True)
+        return
+    _tod_last[interaction.user.id] = now
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/tod` inside a server.", ephemeral=True)
+        return
+    key = (interaction.guild.id, interaction.channel.id)
+    starter = player.id if (player and not player.bot) else interaction.user.id
+    game = _tod_games.get(key)
+    if game is None:
+        game = {"queue": [starter], "idx": 0, "host_id": interaction.user.id,
+                "round": 0, "current": None, "passes_used": 0, "use_ai": use_ai}
+        _tod_games[key] = game
+    elif starter not in game["queue"]:
+        game["queue"].append(starter)
+    view = TODView(key, timeout=180)
+    if choice == "none":
+        embed = discord.Embed(title="🎲 Truth or Dare",
+                              description=f"<@{starter}> starts! Pick **Truth**, **Dare**, or **Random**. 👇",
+                              color=0xA78BFA)
+        embed.set_footer(text=f"Players: {len(game['queue'])} · AI prompts {'on 🤖' if use_ai else 'off 📜'}")
+        await interaction.response.send_message(embed=embed, view=view)
+    else:
+        # Defer FIRST: AI generation can outlive the 3s interaction window.
+        await interaction.response.defer(thinking=False)
+        real_kind, text = await _tod_pick(interaction.guild.id, choice, use_ai)
+        game["current"] = {"type": real_kind, "text": text, "player": starter}
+        game["round"] += 1
+        embed = _tod_embed(f"<@{starter}>", real_kind, text, game["round"], TOD_PASS_LIMIT)
+        await interaction.followup.send(embed=embed, view=view)
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
+
+
+@bot.tree.command(name="truthordare", description="Truth-or-Dare: multiplayer rotation + AI prompts.")
+@app_commands.describe(player="First player (default: you). Others join by pressing buttons on their turn.",
+                       choice="Draw immediately, or let buttons decide",
+                       use_ai="Use AI for prompts when available (default True)")
+@app_commands.choices(choice=[app_commands.Choice(name="Pick with buttons", value="none"),
+                              app_commands.Choice(name="💭 Truth", value="truth"),
+                              app_commands.Choice(name="🔥 Dare", value="dare"),
+                              app_commands.Choice(name="🎲 Random", value="random")])
+async def truthordare(interaction: discord.Interaction, player: discord.Member | None = None,
+                      choice: str = "none", use_ai: bool = True):
+    """Full name — the one normal users will actually try."""
+    await _tod_start(interaction, player=player, choice=choice, use_ai=use_ai)
+
+
+@bot.tree.command(name="tod", description="Short for /truthordare.")
+@app_commands.describe(player="First player (default: you).",
+                       choice="Draw immediately, or let buttons decide",
+                       use_ai="Use AI for prompts when available (default True)")
+@app_commands.choices(choice=[app_commands.Choice(name="Pick with buttons", value="none"),
+                              app_commands.Choice(name="💭 Truth", value="truth"),
+                              app_commands.Choice(name="🔥 Dare", value="dare"),
+                              app_commands.Choice(name="🎲 Random", value="random")])
+async def tod(interaction: discord.Interaction, player: discord.Member | None = None,
+              choice: str = "none", use_ai: bool = True):
+    """Short alias for /truthordare."""
+    await _tod_start(interaction, player=player, choice=choice, use_ai=use_ai)
+
+
+# ---------------------------------------------------------------------------
+# Majority Rules — guess what the crowd picks (donate/vote-style questions)
+# ---------------------------------------------------------------------------
+_MAJORITY_QUESTIONS = [
+    ("Do more people donate to animal shelters or food banks?", "🐾 Animal shelters", "🍽️ Food banks"),
+    ("Do more people Google 'weather' or 'news' every morning?", "🌤️ Weather", "📰 News"),
+    ("Do more people prefer working from home or the office?", "🏠 Home", "🏢 Office"),
+    ("Do more people donate clothes or throw them away?", "👕 Donate", "🗑️ Toss"),
+    ("Do more people Google symptoms or call a doctor first?", "🔍 Google it", "📞 Doctor"),
+    ("Do more people tip 20%+ or under 15%?", "💰 20%+", "🪙 Under 15%"),
+    ("Do more people vote in local elections or skip them?", "🗳️ Vote local", "😴 Skip"),
+    ("Do more people donate to disaster relief or local schools?", "🌊 Disaster relief", "🏫 Local schools"),
+    ("Do more people Google a recipe or wing it?", "📖 Recipe", "👨‍🍳 Wing it"),
+    ("Do more people keep old phones or recycle them?", "📱 Keep", "♻️ Recycle"),
+    ("Do more people prefer cats or dogs?", "🐱 Cats", "🐶 Dogs"),
+    ("Do more people text or call?", "💬 Text", "📞 Call"),
+    ("Do more people donate blood or say they will 'someday'?", "🩸 Donate", "📅 Someday"),
+    ("Do more people Google the ending or watch it through?", "🔍 Spoil it", "🎬 Watch through"),
+    ("Do more people tip street performers or walk past?", "🎺 Tip", "🚶 Walk past"),
+    ("Do more people wake up to an alarm or naturally?", "⏰ Alarm", "🌅 Naturally"),
+    ("Do more people Google 'how to' or ask a friend first?", "🔍 Google how-to", "🙋 Ask a friend"),
+    ("Do more people donate to ocean cleanup or tree planting?", "🌊 Ocean cleanup", "🌳 Plant trees"),
+    ("Do more people stream movies or go to the cinema?", "📺 Stream", "🎬 Cinema"),
+    ("Do more people Google a word's spelling or guess it?", "🔍 Check spelling", "✍️ Guess it"),
+    ("Do more people volunteer monthly or once a year?", "📅 Monthly", "🎉 Yearly"),
+    ("Do more people use dark mode or light mode?", "🌙 Dark", "☀️ Light"),
+    ("Do more people donate old books or keep them forever?", "📚 Donate books", "📖 Keep forever"),
+    ("Do more people Google directions or trust memory?", "🗺️ Google maps", "🧠 Memory"),
+    ("Do more people tip delivery drivers extra or the default?", "💰 Extra tip", "🧾 Default"),
+]
+
+# Side art (dicebear bot avatars — generated, not stored, family-friendly).
+_MAJ_IMG = {
+    "a": "https://api.dicebear.com/9.x/bottts-neutral/png?seed=MajA&backgroundColor=3b82f6",
+    "b": "https://api.dicebear.com/9.x/bottts-neutral/png?seed=MajB&backgroundColor=ef4444",
+}
+
+_majority_games = {}
+_majority_last = {}
+MAJ_DURATION = 15
+MAJ_COOLDOWN = 10
+
+
+def _maj_bar(pct: int, width: int = 12) -> str:
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _maj_embed(state) -> discord.Embed:
+    a, b = state["a"], state["b"]
+    va, vb = len(state["votes_a"]), len(state["votes_b"])
+    total = va + vb
+    pa = round(va / total * 100) if total else 50
+    pb = 100 - pa if total else 50
+    lead = "⚖️ Tied!" if va == vb else (f"🔵 A leads!" if va > vb else "🔴 B leads!")
+    desc = (
+        f"❓ **{state['question']}**\n\n"
+        f"🔵 **A:** {a}\n`{_maj_bar(pa)}` **{pa}%** ({va})\n\n"
+        f"🔴 **B:** {b}\n`{_maj_bar(pb)}` **{pb}%** ({vb})\n\n"
+        f"{lead}\n👥 **{total} vote(s)** — vote, then the majority scores!"
+    )
+    embed = discord.Embed(title="📊 Majority Rules — guess the crowd!", description=desc, color=0x22C55E)
+    embed.set_thumbnail(url=_MAJ_IMG["a"])
+    embed.set_image(url=_MAJ_IMG["b"])
+    embed.set_footer(text=f"Ends in {max(0, int(state['ends_at'] - time.time()))}s · majority voters score 🏆")
+    return embed
+
+
+class MajButton(discord.ui.Button):
+    def __init__(self, side: str):
+        self.side = side
+        super().__init__(style=discord.ButtonStyle.primary if side == "a" else discord.ButtonStyle.danger,
+                         label="A" if side == "a" else "B",
+                         emoji="🔵" if side == "a" else "🔴")
+
+    async def callback(self, interaction: discord.Interaction):
+        cmd_tick("majority_vote")
+        view: MajView = self.view
+        state = view.state
+        uid = interaction.user.id
+        state["votes_a"].discard(uid)
+        state["votes_b"].discard(uid)
+        (state["votes_a"] if self.side == "a" else state["votes_b"]).add(uid)
+        await view.render(interaction)
+
+
+class MajView(discord.ui.View):
+    def __init__(self, state, timeout: int = MAJ_DURATION):
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.message = None
+        self.add_item(MajButton("a"))
+        self.add_item(MajButton("b"))
+
+    async def render(self, interaction: discord.Interaction):
+        embed = _maj_embed(self.state)
+        try:
+            if self.message:
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                await interaction.response.send_message(embed=embed, view=self)
+                self.message = await interaction.original_response()
+        except discord.NotFound:
+            # Interaction expired (3s window) but the game is live — update in place.
+            try:
+                if self.message:
+                    await self.message.edit(embed=embed, view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        except discord.HTTPException:
+            pass
+        # Multi mode: everyone has voted → end right away.
+        try:
+            await self._maybe_auto_end(interaction)
+        except Exception:
+            pass
+
+    async def _maybe_auto_end(self, interaction=None):
+        """Multi: all present members voted → finish. Single: one vote ends it."""
+        if self.state.get("mode") == "single":
+            total = len(self.state["votes_a"]) + len(self.state["votes_b"])
+            if total >= 1:
+                await self.finish(interaction, reason="vote in")
+            return
+        try:
+            members = sum(1 for m in self.state.get("guild_members", []) if not m.get("bot"))
+        except Exception:
+            members = 0
+        if members <= 0:
+            return
+        voted = len(self.state["votes_a"] | self.state["votes_b"])
+        if voted >= members:
+            await self.finish(interaction, reason="everyone voted")
+
+    async def finish(self, interaction_or_none, reason="time"):
+        key = self.state["key"]
+        _majority_games.pop(key, None)
+        for c in self.children:
+            c.disabled = True
+        va, vb = len(self.state["votes_a"]), len(self.state["votes_b"])
+        t0 = self.state.get("started_at", time.time())
+        elapsed = max(0.1, time.time() - t0)
+        if va == vb:
+            result = "🤝 Tie — no points!"
+            color = 0xA78BFA
+        else:
+            winners = self.state["votes_a"] if va > vb else self.state["votes_b"]
+            win_side = "A" if va > vb else "B"
+            # Faster majority = bigger bonus (15s rounds reward speed).
+            speed_bonus = max(0, round((MAJ_DURATION - elapsed) / MAJ_DURATION * 5))
+            pts = 1 + speed_bonus
+            mentions = ", ".join(f"<@{u}>" for u in list(winners)[:10])
+            result = f"🏆 **Side {win_side} takes it!** {va}–{vb}\n{mentions} guessed the crowd! +{pts} 🏅 ({elapsed:.0f}s, speed bonus +{speed_bonus})"
+            color = 0x22C55E
+        embed = _maj_embed(self.state)
+        embed.add_field(name="🏁 Final", value=result, inline=False)
+        embed.set_footer(text=f"Closed ({reason}) · thanks for voting!")
+        embed.color = color
+        try:
+            if interaction_or_none is not None and hasattr(interaction_or_none, "response"):
+                try:
+                    await interaction_or_none.response.edit_message(embed=embed, view=self)
+                except discord.InteractionResponded:
+                    await self.message.edit(embed=embed, view=self)
+            elif self.message:
+                await self.message.edit(embed=embed, view=self)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+        self.stop()
+
+    async def on_timeout(self):
+        await self.finish(None, reason="15s up")
+
+
+@bot.tree.command(name="majority", description="Majority Rules: vote, then the crowd majority scores!")
+@app_commands.describe(mode="Single (your vote ends it) or multi (waits for everyone, 15s)")
+@app_commands.choices(mode=[app_commands.Choice(name="👤 Single (default)", value="single"),
+                            app_commands.Choice(name="👥 Multi (everyone votes)", value="multi")])
+async def majority(interaction: discord.Interaction, mode: str = "single"):
+    cmd_tick("majority")
+    now = time.time()
+    if now - _majority_last.get(interaction.user.id, 0) < MAJ_COOLDOWN:
+        await interaction.response.send_message(f"⏳ Slow down — try again in {MAJ_COOLDOWN}s.", ephemeral=True)
+        return
+    _majority_last[interaction.user.id] = now
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/majority` inside a server.", ephemeral=True)
+        return
+    key = (interaction.guild.id, interaction.channel.id)
+    if key in _majority_games:
+        await interaction.response.send_message("📊 A Majority Rules round is already running here — vote on it!", ephemeral=True)
+        return
+    q, a, b = random.choice(_MAJORITY_QUESTIONS)
+    members = []
+    try:
+        if mode == "multi" and interaction.guild:
+            members = [{"id": m.id, "bot": m.bot} for m in interaction.guild.members if not m.bot][:50]
+    except Exception:
+        members = []
+    state = {"key": key, "question": q, "a": a, "b": b,
+             "votes_a": set(), "votes_b": set(), "mode": mode,
+             "guild_members": members, "started_at": time.time(),
+             "host_id": interaction.user.id, "ends_at": time.time() + MAJ_DURATION}
+    _majority_games[key] = state
+    view = MajView(state)
+    embed = _maj_embed(state)
+    tag = "👥 Multi — everyone votes, auto-ends when all in!" if mode == "multi" else "👤 Single — your vote ends it!"
+    await interaction.response.send_message(tag, embed=embed, view=view)
+    try:
+        view.message = await interaction.original_response()
+    except (discord.HTTPException, discord.NotFound):
+        view.message = None
+
+
+# ---------------------------------------------------------------------------
+# Word Scramble — race to unscramble, fastest wins
+# ---------------------------------------------------------------------------
+_scramble_games = {}
+
+_SCRAMBLE_WORDS = ["PYTHON", "DISCORD", "ROBOT", "DRAGON", "PIZZA", "GUITAR", "CASTLE",
+                   "ROCKET", "PLANET", "OCEAN", "TIGER", "PANDA", "WIZARD", "PIRATE",
+                   "COMPUTER", "BOOK", "GARDEN", "MOUNTAIN", "RAINBOW", "TREASURE"]
+
+
+def _scramble_word(word: str) -> str:
+    letters = list(word)
+    for _ in range(20):
+        random.shuffle(letters)
+        if "".join(letters) != word:
+            break
+    return " ".join(letters)
+
+
+@bot.tree.command(name="scramble", description="Word Scramble race — fastest to unscramble wins!")
+async def scramble(interaction: discord.Interaction):
+    cmd_tick("scramble")
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/scramble` inside a server.", ephemeral=True)
+        return
+    key = (interaction.guild.id, interaction.channel.id)
+    if key in _scramble_games:
+        await interaction.response.send_message("🔀 A scramble is already running here — solve it with `/unscramble`!", ephemeral=True)
+        return
+    word = random.choice(_SCRAMBLE_WORDS)
+    _scramble_games[key] = {"word": word, "at": time.time(), "host_id": interaction.user.id}
+    embed = discord.Embed(title="🔀 Word Scramble — race!",
+                          description=f"Unscramble this:\n\n# `{_scramble_word(word)}`\n\nFirst to `/unscramble <word>` wins! 🏁",
+                          color=0xF59E0B)
+    embed.set_footer(text="60s on the clock · anyone can answer")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="unscramble", description="Answer the running word scramble.")
+@app_commands.describe(word="Your unscrambled guess")
+async def unscramble(interaction: discord.Interaction, word: str):
+    cmd_tick("unscramble")
+    if interaction.guild is None:
+        await interaction.response.send_message("Use `/unscramble` inside a server.", ephemeral=True)
+        return
+    key = (interaction.guild.id, interaction.channel.id)
+    game = _scramble_games.get(key)
+    if not game:
+        await interaction.response.send_message("No scramble running here. Start one with `/scramble`!", ephemeral=True)
+        return
+    if time.time() - game["at"] > 60:
+        _scramble_games.pop(key, None)
+        await interaction.response.send_message(f"⏰ Time! The word was `{game['word']}`.", ephemeral=True)
+        return
+    if word.strip().upper() == game["word"]:
+        dt = round(time.time() - game["at"], 1)
+        _scramble_games.pop(key, None)
+        embed = discord.Embed(title="🏆 Correct!",
+                              description=f"{interaction.user.mention} unscrambled `{game['word']}` in **{dt}s**! ⚡",
+                              color=0x22C55E)
+        await interaction.response.send_message(embed=embed)
+    else:
+        await interaction.response.send_message(f"`{word.strip().upper()}` — nope, keep trying! 🔀", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2724,13 +3997,15 @@ async def ai_personality(interaction: discord.Interaction, name: str):
     key = name.strip()
     if key == "none":
         set_cfg(interaction.guild.id, "ai_personality", "none")
-        await interaction.response.send_message("Personality → **none** (default buddy).")
+        ai_queue.drop(interaction.guild.id)
+        await interaction.response.send_message("Personality → **none** (default buddy). Applies to your next reply! ⚡")
         return
     if key not in PERSONALITIES and key not in guild_presets(interaction.guild.id, "personality"):
         await interaction.response.send_message(f"Unknown personality `{key}`.", ephemeral=True)
         return
     set_cfg(interaction.guild.id, "ai_personality", key)
-    await interaction.response.send_message(f"Personality → **{key}**.")
+    ai_queue.drop(interaction.guild.id)
+    await interaction.response.send_message(f"Personality → **{key}**. Applies to your next reply! ⚡")
 
 
 @AI_GROUP.command(name="character", description="Set how the bot pretends to be (or 'none').")
@@ -2747,13 +4022,15 @@ async def ai_character(interaction: discord.Interaction, name: str):
     key = name.strip()
     if key == "none":
         set_cfg(interaction.guild.id, "ai_character", "")
-        await interaction.response.send_message("Character → **none**.")
+        ai_queue.drop(interaction.guild.id)
+        await interaction.response.send_message("Character → **none**. Applies to your next reply! ⚡")
         return
     if key not in CHARACTERS and key not in guild_presets(interaction.guild.id, "character"):
         await interaction.response.send_message(f"Unknown character `{key}`.", ephemeral=True)
         return
     set_cfg(interaction.guild.id, "ai_character", key)
-    await interaction.response.send_message(f"Character → **{key}**.")
+    ai_queue.drop(interaction.guild.id)
+    await interaction.response.send_message(f"Character → **{key}**. Applies to your next reply! ⚡")
 
 
 @AI_GROUP.command(name="status", description="Show this server's AI settings.")
@@ -2766,6 +4043,7 @@ async def ai_status(interaction: discord.Interaction):
     allowed_note = "everywhere" if not (cfg["ai_channels"] or "").strip() else "picked channels only"
     source_note = "shared Quaestio box" if cfg["source"] == "shared" else (f"your own box{f' (in community pool)' if cfg['contribute'] else ''}")
     personality = get_cfg(interaction.guild.id, "ai_personality", "none")
+    character = get_cfg(interaction.guild.id, "ai_character", "")
     admin = is_admin(interaction.user)
     contributor = bool(cfg.get("contributor_perks"))
     embed = discord.Embed(
@@ -2794,6 +4072,8 @@ async def ai_status(interaction: discord.Interaction):
     )
     if cfg.get("ai_character"):
         embed.add_field(name="Character", value=f"`{cfg['ai_character']}`", inline=False)
+    elif character:
+        embed.add_field(name="Character", value=f"`{character}`", inline=False)
     if contributor:
         mult = contributor_mult(interaction.guild.id)
         embed.set_footer(text=f"🌟 Pool contributor badge — priority routing + {mult}x request limits")
@@ -2825,8 +4105,30 @@ async def pool_info(interaction: discord.Interaction):
         total = pool_total_share()
     except Exception:
         nodes, total = [], 0
+    total_nodes = 0
+    try:
+        total_nodes = len(pool_hosters())
+    except Exception:
+        total_nodes = len(nodes)
+    try:
+        n_active = len(pool_active_nodes(limit=25))
+    except Exception:
+        n_active = 0
     lines = ["**⚡ Community pool**",
-             f"Anonymous nodes online: **{len(nodes)}** · shared capacity: **{total}%**"]
+             f"Registered nodes: **{total_nodes}** (enabled, incl. offline/cooling) · shared capacity: **{total}%**",
+             f"Active now: **{n_active}** responding/listening"]
+    try:
+        active = pool_active_nodes(limit=8)
+        if active:
+            names = ", ".join(f"`{a['name']}`" for a in active[:8])
+            n_listen = sum(1 for a in active if a["pull"])
+            lines.append(f"🟢 Active now ({len(active)} listening/responding): {names}")
+            if n_listen:
+                lines.append(f"📡 {n_listen} pull worker(s) listening for jobs")
+        else:
+            lines.append("⚪ No pool nodes active right now — serving from the host box")
+    except Exception:
+        pass
     try:
         leaders = pool_leaders(limit=3)
         medals = ["🥇", "🥈", "🥉"]
