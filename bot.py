@@ -1916,11 +1916,16 @@ async def on_message(message: discord.Message):
     old_level = level_for_messages(messages - 1)
     if new_level > old_level and new_level > 1:
         if flag_on(message.guild.id, "level_announce", "1"):
+            nxt = xp_for_level(new_level + 1)
+            pct = min(1.0, messages / nxt) if nxt else 1.0
+            filled = round(pct * 10)
+            bar = "▰" * filled + "▱" * (10 - filled)
             try:
                 await message.channel.send(
-                    f"🎉 {message.author.mention} reached **level {new_level}**!"
+                    f"🎉 {message.author.mention} reached **level {new_level}**!\n"
+                    f"{bar} {messages}/{nxt} XP"
                 )
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.HTTPException):
                 pass
         role_id = get_cfg(message.guild.id, "levelrole")
         if role_id and str(role_id).strip().isdigit():
@@ -1954,9 +1959,54 @@ async def on_member_join(member: discord.Member):
         member.guild.id, "welcome_message",
         f"Welcome to {member.guild.name}, {member.mention}! 👋",
     )
+    # Banner: {banner} URL, {icon} = server icon, {avatar} = member avatar,
+    # plus {member}, {server}, {count}.
+    banner = (get_cfg(member.guild.id, "welcome_banner", "") or "").strip()
+    icon = member.guild.icon.url if member.guild.icon else ""
+    avatar = member.display_avatar.url if hasattr(member, "display_avatar") else ""
+    text = text.replace("{member}", member.mention).replace("{server}", member.guild.name)
     try:
-        await channel.send(f"{text}")
-    except discord.Forbidden:
+        text = text.replace("{count}", str(member.guild.member_count or "?"))
+    except Exception:
+        pass
+    text = text.replace("{icon}", icon).replace("{avatar}", avatar)
+    embed = None
+    files = []
+    if banner.lower().startswith(("http://", "https://")) and len(banner) < 500:
+        embed = discord.Embed(description=text[:4000], color=0xA78BFA)
+        embed.set_image(url=banner)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+        text = ""
+    try:
+        if embed is not None:
+            await channel.send(embed=embed)
+        elif text:
+            await channel.send(text)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    # Level-up celebration hook data lives on the member row already; the
+    # announce below in on_message covers rank upgrades with bars.
+    return
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if member.bot or not flag_on(member.guild.id, "welcome_enabled", "1"):
+        return
+    channel_id = get_cfg(member.guild.id, "welcome_channel")
+    if not channel_id or not str(channel_id).strip().isdigit():
+        return
+    channel = member.guild.get_channel(int(channel_id))
+    if not channel:
+        return
+    text = (get_cfg(member.guild.id, "goodbye_message", "") or "").strip()
+    if not text:
+        return
+    text = text.replace("{member}", member.display_name).replace("{server}", member.guild.name)
+    try:
+        await channel.send(text[:2000])
+    except (discord.Forbidden, discord.HTTPException):
         pass
 
 
@@ -3038,10 +3088,12 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
     conn.close()
     messages = row["messages"] if row else 0
     level = level_for_messages(messages)
+    nxt = xp_for_level(level + 1)
+    pct = min(1.0, messages / nxt) if nxt else 1.0
+    filled = round(pct * 10)
+    bar = "▰" * filled + "▱" * (10 - filled)
     await interaction.response.send_message(
-        f"{member.mention} — **Level {level}** · {messages} messages "
-        f"(next level at {xp_for_level(level + 1)})",
-        ephemeral=True,
+        f"🎉 {member.mention} — **Level {level}**\n{bar} {messages}/{nxt} XP",
     )
 
 
